@@ -161,7 +161,6 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   HostFeatures.ProcessPID = ProcessPID;
   HostFeatures.ProcessFeatures.HostType = HostType;
   HostFeatures.ProcessFeatures.Is64BitMode = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
-  HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
   /* iOS-Madeira: AVX/AVX2 stay off (titles that check CPUID take their SSE
    * paths), but a game built for AVX dies on its first VEX instruction. The app
    * sets MADEIRA_FEX_AVX=1 for such a game; FEX then runs AVX through its
