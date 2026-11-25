@@ -6,6 +6,7 @@
 #include <FEXCore/Utils/LogManager.h>
 
 #ifndef _WIN32
+#include <cerrno>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -38,12 +39,39 @@ static bool RecursiveRemoveDirectory(int parent_fd, const char* Directory) {
   int dir_fd = ::openat(parent_fd, Directory, DIR_FLAGS);
 
   if (dir_fd == -1) {
-    if (errno == ENOENT) {
-      // Probably raced something. Non-error.
-      return true;
+    return errno == ENOENT;
+  }
+
+#ifdef __APPLE__
+  DIR* dir = ::fdopendir(dir_fd);
+  if (!dir) {
+    close(dir_fd);
+    return false;
+  }
+
+  bool Result = true;
+  while (const struct dirent* entry = ::readdir(dir)) {
+    std::string_view path_name_view = entry->d_name;
+    if (path_name_view == "." || path_name_view == "..") {
+      continue;
+    }
+
+    const bool is_dir = entry->d_type == DT_DIR;
+    if (is_dir && !RecursiveRemoveDirectory(dir_fd, entry->d_name)) {
+      Result = false;
+      break;
+    }
+
+    if (!unlinkat(dir_fd, entry->d_name, is_dir)) {
+      LogMan::Msg::IFmt("Failed to remove file: {}", path_name_view);
+      Result = false;
+      break;
     }
   }
 
+  ::closedir(dir);
+  return Result;
+#else
   // Walk the directory listing.
   bool Result = true;
   // Four pages arbitrary chosen to be a balance between NFS wanting to return data in page-size granules and
@@ -123,6 +151,7 @@ end:
 
   close(dir_fd);
   return Result;
+#endif
 }
 
 FEX_DEFAULT_VISIBILITY bool RecursiveRemoveDirectory(const fextl::string& Directory) {
@@ -135,11 +164,26 @@ FEX_DEFAULT_VISIBILITY void WalkDirectory(std::string_view Directory,
   constexpr int DIR_FLAGS = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
   int dir_fd = ::openat(AT_FDCWD, fextl::string(Directory).c_str(), DIR_FLAGS);
   if (dir_fd == -1) {
-    if (errno == ENOENT) {
-      // Probably raced something. Non-error.
-      return;
-    }
+    return;
   }
+#ifdef __APPLE__
+  DIR* dir = ::fdopendir(dir_fd);
+  if (!dir) {
+    close(dir_fd);
+    return;
+  }
+
+  while (const struct dirent* entry = ::readdir(dir)) {
+    std::string_view path_name_view = entry->d_name;
+    if (path_name_view == "." || path_name_view == "..") {
+      continue;
+    }
+    Callback(path_name_view, entry->d_type == DT_DIR, user_data);
+  }
+
+  ::closedir(dir);
+}
+#else
   // Four pages arbitrary chosen to be a balance between NFS wanting to return data in page-size granules and
   // local filesystems returning arbitrary sizes.
   size_t dirent_size = 4096 * 4;
@@ -200,6 +244,7 @@ end:
 
   close(dir_fd);
 }
+#endif
 
 #else
 static inline std::optional<UNICODE_STRING> PathToNTPath(std::string_view Path) {
