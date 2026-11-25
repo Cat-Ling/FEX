@@ -428,12 +428,12 @@ def print_affects_codegen_options(options, unnamed_options):
     for op_group, group_vals in options.items():
         for op_key, op_vals in group_vals.items():
             assert "AffectsCodeGen" in op_vals, "All config options must be marked if they affect codegen."
-            output_argloader.write("\t{}, // {}\n".format(op_vals["AffectsCodeGen"], op_key))
+            output_argloader.write("\t{}, // {}\n".format(str(op_vals["AffectsCodeGen"]).lower(), op_key))
 
     for op_group, group_vals in unnamed_options.items():
         for op_key, op_vals in group_vals.items():
             assert "AffectsCodeGen" in op_vals, "All config options must be marked if they affect codegen."
-            output_argloader.write("\t{}, // {}\n".format(op_vals["AffectsCodeGen"], op_key))
+            output_argloader.write("\t{}, // {}\n".format(str(op_vals["AffectsCodeGen"]).lower(), op_key))
     output_argloader.write("}};\n")
 
     output_argloader.write("#endif\n")
