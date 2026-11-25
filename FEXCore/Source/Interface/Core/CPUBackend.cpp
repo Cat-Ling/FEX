@@ -434,6 +434,35 @@ namespace CPU {
     return nullptr;
   }
 
+#ifdef FEX_IOS_HOST
+  int CPUBackend::IosRemoteMigrateStale(const fextl::shared_ptr<CodeBuffer>& LatestBuf) {
+    for (int Attempt = 0; Attempt < 4; Attempt++) {
+      fextl::shared_ptr<CodeBuffer> KeepAlive;
+      {
+        IosMigrateLockGuard g {IosMigrateLock};
+        KeepAlive = CurrentCodeBuffer;
+      }
+      if (!KeepAlive || KeepAlive == LatestBuf) {
+        return 0;
+      }
+      auto lk = KeepAlive->LookupCache->AcquireWriteLock();
+      IosMigrateLockGuard g {IosMigrateLock};
+      if (CurrentCodeBuffer != KeepAlive) {
+        continue;
+      }
+      if (ThreadState->CurrentFrame->SignalHandlerRefCounter != 0) {
+        return -1;
+      }
+      auto Prev = std::exchange(CurrentCodeBuffer, LatestBuf);
+      ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *LatestBuf->LookupCache, lk);
+      FEXCore::Core::ResetCallRetStack(ThreadState, "cpubackend");
+      SignalHandlerCodeBuffers.clear();
+      return 1;
+    }
+    return -2;
+  }
+#endif
+
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
   /* iOS-Madeira ml460 (#75): the pool-tail sweep. ml459 proved the 208MB tail
    * is 13 live generations where steady state needs ~2 — each pinned by the
