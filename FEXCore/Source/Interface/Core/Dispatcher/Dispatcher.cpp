@@ -23,6 +23,7 @@
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/Debug/InternalThreadState.h>
+#include <FEXCore/fextl/fmt.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/Event.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -188,7 +189,7 @@ void Dispatcher::EmitDispatcher() {
     ldr(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
   }
 
-  FillSpecialRegs(TMP1, TMP2, false, true);
+  FillSpecialRegs(TMP1, TMP2, {.SetFIZ = false, .SetPredRegs = true});
 
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira: skip the opportunistic call-ret-stack return on iOS. The
@@ -437,8 +438,15 @@ void Dispatcher::EmitDispatcher() {
     str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
 
     // Trigger segfault if any deferred signals are pending
-    strb(ARMEmitter::XReg::zr, STATE,
-         offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
+    constexpr size_t InterruptPageOffset =
+      offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
+    if constexpr (InterruptPageOffset <= 32760) {
+      str(ARMEmitter::XReg::zr, STATE, InterruptPageOffset);
+    } else {
+      // Need to use vector 128-bit store for this range.
+      // Doesn't matter which register we use to store.
+      str(ARMEmitter::QReg::q0, STATE, InterruptPageOffset);
+    }
 #endif
   };
 
@@ -518,7 +526,7 @@ void Dispatcher::EmitDispatcher() {
       ldr(ARMEmitter::XReg::x4, &l_CompileSingleStep);
 
       if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
-        GenerateIndirectRuntimeCall<uintptr_t, void*, void*, uint64_t, uint64_t>(ARMEmitter::Reg::r4);
+        GenerateIndirectRuntimeCall<uintptr_t, void*, void*, uint64_t>(ARMEmitter::Reg::r4);
       } else {
         blr(ARMEmitter::Reg::r4); // { CTX, Frame, RIP }
       }
@@ -552,44 +560,22 @@ void Dispatcher::EmitDispatcher() {
   }
 
   {
-    // Guest SIGILL handler
-    // Needs to be distinct from the SignalHandlerReturnAddress
-    GuestSignal_SIGILL = GetCursorAddress<uint64_t>();
+    // Faultless synchronous signal.
+    // Some games abuse SIGILL/SIGTRAP/SIGSEGV heavily and the fault overhead is visible.
+    // Instead of double faulting, clean up state and jump to the frontend to handle this.
+    // `FEXCore::Core::CpuStateFrame::SynchronousFaultData` needs to be setup at this point.
+    GuestSignal_SynchronousFault = GetCursorAddress<uint64_t>();
 
     SpillStaticRegs(TMP1);
 
-    hlt(0);
-  }
+    ldr(ARMEmitter::XReg::x0, &l_CTX);
+    mov(ARMEmitter::XReg::x1, STATE);
+    ldr(ARMEmitter::XReg::x2, STATE_PTR(CpuStateFrame, Pointers.SynchronousExceptionHandler));
 
-  {
-    // Guest SIGTRAP handler
-    // Needs to be distinct from the SignalHandlerReturnAddress
-    GuestSignal_SIGTRAP = GetCursorAddress<uint64_t>();
-
-    SpillStaticRegs(TMP1);
-
-    brk(0);
-  }
-
-  {
-    // Guest Overflow handler
-    // Needs to be distinct from the SignalHandlerReturnAddress
-    GuestSignal_SIGSEGV = GetCursorAddress<uint64_t>();
-
-    SpillStaticRegs(TMP1);
-
-    // hlt/udf = SIGILL
-    // brk = SIGTRAP
-    // ??? = SIGSEGV
-    // Force a SIGSEGV by loading zero
-    if (CTX->ExitOnHLTEnabled()) {
-      ldr(ARMEmitter::XReg::x0, STATE_PTR(CpuStateFrame, ReturningStackLocation));
-      add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::r0, 0);
-      PopCalleeSavedRegisters();
-      ret();
+    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+      GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
     } else {
-      LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, 0);
-      ldr(ARMEmitter::XReg::x1, ARMEmitter::Reg::r1);
+      br(ARMEmitter::Reg::r2);
     }
   }
 
@@ -761,43 +747,175 @@ void Dispatcher::EmitDispatcher() {
     (void)b(&LoopTop);
   }
 
-  auto EmitLongALUOpHandler = [&](auto R, auto Offset) {
-    auto Address = GetCursorAddress<uint64_t>();
+  auto EmitL1Lookup = [&](int rip_offset = 0) {
+    // L1 lookup after syscall. Mirrors the implementation in `ExitFunction`.
+    // Most syscall instructions just return to the following RIP, so it is highly likely to be in the L1 in tight loops.
+    ldr(TMP3, STATE_PTR(CpuStateFrame, State.rip));
 
-    PushDynamicRegs(TMP4);
-    SpillStaticRegs(TMP4);
+    // TF may be set: a single-stepped SYSCALL or CPUID. An L1 hit would jump into a block compiled without the
+    // per-instruction single-step trap, and the trap would only be raised at the next dispatcher entry, instructions
+    // later. The loop top checks TF and compiles single-step blocks.
+    ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));
+    (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &LoopTop);
 
-    if (!TMP_ABIARGS) {
-      mov(ARMEmitter::XReg::x0, TMP1);
-      mov(ARMEmitter::XReg::x1, TMP2);
-      mov(ARMEmitter::XReg::x2, TMP3);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+
+    if (rip_offset) {
+      add(ARMEmitter::Size::i64Bit, TMP3, TMP3, rip_offset);
     }
 
-    ldr(ARMEmitter::XReg::x3, R, Offset);
+    // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+    // L1Mask is pre-shifted.
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    add(TMP1, TMP1, TMP2);
+
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
+
+    sub(TMP1, TMP1, TMP3);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &LoopTop);
+    br(TMP2);
+  };
+
+  {
+    // All dynamic and static registers are spilled coming in to this handler.
+    // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
+    ThreadDispatchSyscallHandler = GetCursorAddress<uint64_t>();
+
+    // Store in the state that we are in a syscall
+    // 16bit LoadConstant to be a single instruction
+    // This gives the signal handler a value to check to see if we are in a syscall at all
+    LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, 0xFFFF);
+    str(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+    ldr(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerObj));
+    ldr(ARMEmitter::XReg::x3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerFunc));
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, STATE.R());
+
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
-      GenerateIndirectRuntimeCall<__uint128_t, uint64_t, uint64_t, uint64_t>(ARMEmitter::Reg::r3);
+      GenerateIndirectRuntimeCall<uint64_t, void*, void*, void*>(ARMEmitter::Reg::r3);
     } else {
       blr(ARMEmitter::Reg::r3);
     }
 
-    // Result is now in x0, x1
+    // Fix the stack and any values that were stepped on
+    // Syscall result is in any static register that the frontend desired.
+    FillStaticRegs({
+      .OptionalReg = ARMEmitter::Reg::r1,
+      .OptionalReg2 = ARMEmitter::Reg::r2,
+    });
+
+    // Now the registers we've spilled are back in their original host registers
+    // We can safely claim we are no longer in a syscall
+    str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, InSyscallInfo));
+
+    EmitL1Lookup();
+  }
+
+  {
+    // All dynamic and static registers are spilled coming in to this handler.
+    // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
+    ThreadDispatchCPUIDHandler = GetCursorAddress<uint64_t>();
+
+    // CPUID behaves like an ISB.
+    isb();
+
+    auto RAXReg = GetX86GPRMapping(FEXCore::X86State::REG_RAX);
+    auto RBXReg = GetX86GPRMapping(FEXCore::X86State::REG_RBX);
+    auto RCXReg = GetX86GPRMapping(FEXCore::X86State::REG_RCX);
+    auto RDXReg = GetX86GPRMapping(FEXCore::X86State::REG_RDX);
+
+    ARMEmitter::ForwardLabel SetupCPUIDFault {};
+    ldr(TMP2, STATE, offsetof(FEXCore::Core::CPUState, CoreFlags));
+    (void)tbz(TMP2, FEXCore::ilog2(FEXCore::ToUnderlying(FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED)), &SetupCPUIDFault);
+
+    // TMP1 passes the instruction size. Usually only 2-bytes but prefixes can make it 15.
+    ldr(TMP2, STATE_PTR(CpuStateFrame, State.rip));
+    add(TMP2, TMP2, TMP1);
+    str(TMP2, STATE_PTR(CpuStateFrame, State.rip));
+
+    mov(ARMEmitter::XReg::x1, RAXReg.X());
+    mov(ARMEmitter::XReg::x2, RCXReg.X());
+
+    // x0 = CPUID Handler
+    // x1 = CPUID Function (RAX)
+    // x2 = CPUID Leaf (RCX)
+    ldr(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.CPUIDObj));
+    ldr(ARMEmitter::XReg::x3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.CPUIDFunction));
+
+    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+      GenerateIndirectRuntimeCall<__uint128_t, void*, uint64_t, uint64_t>(ARMEmitter::Reg::r3);
+    } else {
+      blr(ARMEmitter::Reg::r3);
+    }
+
+    // Results are in x0, x1
+    auto Res0 = ARMEmitter::Reg::r0;
+    auto Res1 = ARMEmitter::Reg::r1;
+
     if (!TMP_ABIARGS) {
-      mov(TMP1, ARMEmitter::XReg::x0);
-      mov(TMP2, ARMEmitter::XReg::x1);
+      // SRA Overlaps, need to move.
+      mov(ARMEmitter::Size::i64Bit, TMP1, Res0);
+      mov(ARMEmitter::Size::i64Bit, TMP2, Res1);
+      Res0 = TMP1;
+      Res1 = TMP2;
     }
 
     FillStaticRegs();
 
-    // Fix the stack and any values that were stepped on
-    PopDynamicRegs();
+    // Results need to be moved to 32-bit EAX, ECX, EBX, EDX.
+    mov(ARMEmitter::Size::i32Bit, RAXReg, Res0);
+    mov(ARMEmitter::Size::i32Bit, RCXReg, Res1);
+    ubfx(ARMEmitter::Size::i64Bit, RBXReg, Res0, 32, 32);
+    ubfx(ARMEmitter::Size::i64Bit, RDXReg, Res1, 32, 32);
 
-    // Go back to our code block
-    ret();
-    return Address;
-  };
+    EmitL1Lookup();
 
-  LUDIVHandlerAddress = EmitLongALUOpHandler(STATE_PTR(CpuStateFrame, Pointers.LUDIV));
-  LDIVHandlerAddress = EmitLongALUOpHandler(STATE_PTR(CpuStateFrame, Pointers.LDIV));
+    // CPUID fault handling
+    (void)Bind(&SetupCPUIDFault);
+
+    constexpr Core::CpuStateFrame::SynchronousFaultDataStruct State = {
+      .FaultToTopAndGeneratedException = 1,
+      .Signal = Core::FAULT_SIGSEGV,
+      .TrapNo = X86State::X86_TRAPNO_GP,
+      .si_code = 0x80,
+      .err_code = 0,
+      .FaultAddress = 0, // Comes from register.
+    };
+
+    uint64_t Constant {};
+    memcpy(&Constant, &State, sizeof(uint64_t));
+
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, static_cast<uint64_t>(Constant));
+
+    str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, SynchronousFaultData));
+    ldr(TMP2, STATE_PTR(CpuStateFrame, State.rip));
+    str(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, SynchronousFaultData) + 8);
+
+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SynchronousFault));
+    br(TMP1);
+  }
+
+  {
+    // All dynamic and static registers are spilled coming in to this handler.
+    // It's also the end of block and RIP might have changed, so we jump directly to the top of the loop.
+    ThreadDispatchRemoveCodeEntry = GetCursorAddress<uint64_t>();
+
+    // Arguments are already in x0, x1. Just jump to the handler.
+    ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadRemoveCodeEntryFromJIT));
+    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+      GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
+    } else {
+      blr(ARMEmitter::Reg::r2);
+    }
+
+    FillStaticRegs({
+      .OptionalReg = ARMEmitter::Reg::r1,
+      .OptionalReg2 = ARMEmitter::Reg::r2,
+    });
+
+    // Now go back to the regular dispatcher loop
+    (void)b(&LoopTop);
+  }
 
   EmitF64Sin();
   EmitF64Cos();
@@ -2925,13 +3043,12 @@ void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread) 
     Ptrs.ExitFunctionLinker = ExitFunctionLinkerAddress;
     Ptrs.ThreadStopHandlerSpillSRA = ThreadStopHandlerAddressSpillSRA;
     Ptrs.ThreadPauseHandlerSpillSRA = ThreadPauseHandlerAddressSpillSRA;
-    Ptrs.GuestSignal_SIGILL = GuestSignal_SIGILL;
-    Ptrs.GuestSignal_SIGTRAP = GuestSignal_SIGTRAP;
-    Ptrs.GuestSignal_SIGSEGV = GuestSignal_SIGSEGV;
+    Ptrs.ThreadDispatchSyscallHandler = ThreadDispatchSyscallHandler;
+    Ptrs.ThreadDispatchCPUIDHandler = ThreadDispatchCPUIDHandler;
+    Ptrs.ThreadDispatchRemoveCodeEntry = ThreadDispatchRemoveCodeEntry;
+    Ptrs.GuestSignal_SynchronousFault = GuestSignal_SynchronousFault;
     Ptrs.SignalReturnHandler = SignalHandlerReturnAddress;
     Ptrs.SignalReturnHandlerRT = SignalHandlerReturnAddressRT;
-    Ptrs.LUDIVHandler = LUDIVHandlerAddress;
-    Ptrs.LDIVHandler = LDIVHandlerAddress;
     Ptrs.F64SinHandler = F64SinHandlerAddress;
     Ptrs.F64CosHandler = F64CosHandlerAddress;
     Ptrs.F64TanHandler = F64TanHandlerAddress;

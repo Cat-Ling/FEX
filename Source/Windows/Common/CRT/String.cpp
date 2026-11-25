@@ -20,11 +20,19 @@ extern "C" int __cdecl vsprintf(char* __restrict__ _Dest, const char* __restrict
 
 static unsigned short CTypeData[256];
 static char Locale[2] = "C";
+static wchar_t wLocale[2] = L"C";
 
 DLLEXPORT_FUNC(char*, _strdup, (const char* Src)) {
   size_t Len = strlen(Src) + 1;
   char* Dst = reinterpret_cast<char*>(malloc(Len));
   memcpy(Dst, Src, Len);
+  return Dst;
+}
+
+DLLEXPORT_FUNC(wchar_t*, _wcsdup, (const wchar_t* Src)) {
+  size_t Len = wcslen(Src) + 1;
+  wchar_t* Dst = reinterpret_cast<wchar_t*>(malloc(Len * sizeof(*Dst)));
+  memcpy(Dst, Src, Len * sizeof(*Dst));
   return Dst;
 }
 
@@ -41,6 +49,10 @@ double strtod(const char* __restrict__, char** __restrict__) {
 }
 
 DLLEXPORT_FUNC(double, _strtod_l, (const char* __restrict__ _Str, char** __restrict__ _EndPtr, _locale_t _Locale)) {
+  UNIMPLEMENTED();
+}
+
+DLLEXPORT_FUNC(float, _strtof_l, (const char* __restrict__ _Str, char** __restrict__ _EndPtr, _locale_t _Locale)) {
   UNIMPLEMENTED();
 }
 
@@ -120,11 +132,15 @@ int snprintf(char* stream, size_t n, const char* format, ...) {
   return ret;
 }
 
-char* setlocale(int _Category, const char* _Locale) {
+DLLEXPORT_FUNC(char*, setlocale, (int _Category, const char* _Locale)) {
   return Locale;
 }
 
-int _configthreadlocale(int _Flag) {
+DLLEXPORT_FUNC(wchar_t*, _wsetlocale, (int _Category, const wchar_t* _Locale)) {
+  return wLocale;
+}
+
+DLLEXPORT_FUNC(int, _configthreadlocale, (int _Flag)) {
   return 0;
 }
 
@@ -138,16 +154,17 @@ DLLEXPORT_FUNC(struct lconv*, localeconv, (void)) {
 
 DLLEXPORT_FUNC(void, _free_locale, (_locale_t _Locale)) {}
 
-wint_t btowc(int) {
+DLLEXPORT_FUNC(wint_t, btowc, (int)) {
   UNIMPLEMENTED();
 }
 
-size_t mbsrtowcs(wchar_t* __restrict__ _Dest, const char** __restrict__ _PSrc, size_t _Count,
-                 mbstate_t* __restrict__ _State) __MINGW_ATTRIB_DEPRECATED_SEC_WARN {
+DLLEXPORT_FUNC(size_t, mbsrtowcs, (wchar_t* __restrict__ _Dest, const char** __restrict__ _PSrc, size_t _Count, mbstate_t* __restrict__ _State))
+__MINGW_ATTRIB_DEPRECATED_SEC_WARN {
   UNIMPLEMENTED();
 }
 
-size_t mbrtowc(wchar_t* __restrict__ _DstCh, const char* __restrict__ _SrcCh, size_t _SizeInBytes, mbstate_t* __restrict__ _State) {
+DLLEXPORT_FUNC(size_t, mbrtowc,
+               (wchar_t* __restrict__ _DstCh, const char* __restrict__ _SrcCh, size_t _SizeInBytes, mbstate_t* __restrict__ _State)) {
   UNIMPLEMENTED();
 }
 
@@ -159,11 +176,11 @@ DLLEXPORT_FUNC(int, _mbtowc_l, (wchar_t* __restrict__ DstCh, const char* __restr
   return 1;
 }
 
-size_t mbrlen(const char* __restrict__ _Ch, size_t _SizeInBytes, mbstate_t* __restrict__ _State) {
+DLLEXPORT_FUNC(size_t, mbrlen, (const char* __restrict__ _Ch, size_t _SizeInBytes, mbstate_t* __restrict__ _State)) {
   UNIMPLEMENTED();
 }
 
-size_t wcrtomb(char* __restrict__ _Dest, wchar_t _Source, mbstate_t* __restrict__ _State) {
+DLLEXPORT_FUNC(size_t, wcrtomb, (char* __restrict__ _Dest, wchar_t _Source, mbstate_t* __restrict__ _State)) {
   UNIMPLEMENTED();
 }
 
@@ -171,7 +188,7 @@ DLLEXPORT_FUNC(errno_t, wcrtomb_s, (size_t* _Retval, char* _Dst, size_t _SizeInB
   UNIMPLEMENTED();
 }
 
-int wctob(wint_t _WCh) {
+DLLEXPORT_FUNC(int, wctob, (wint_t _WCh)) {
   UNIMPLEMENTED();
 }
 

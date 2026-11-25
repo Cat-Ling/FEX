@@ -12,6 +12,7 @@ $end_info$
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/CoreState.h>
+#include <FEXCore/Core/DiskCacheFileMapper.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Config/Config.h>
@@ -37,6 +38,7 @@ $end_info$
 #include "Common/Exception.h"
 #include "Common/ImageTracker.h"
 #include "Common/InvalidationTracker.h"
+#include "Common/Threads.h"
 #include "Common/OvercommitTracker.h"
 #include "Common/TSOHandlerConfig.h"
 #include "Common/CPUFeatures.h"
@@ -137,6 +139,8 @@ extern void* ExitFunctionECJit;
 extern void* CheckCall;
 extern void* ExitFunctionSuspendPoint;
 extern void* ExitFunctionSuspendResumePoint;
+extern uint64_t SyscallTable[];
+extern uint64_t SyscallTableEnd[];
 
 void* X64ReturnInstr; // See Module.S
 uintptr_t NtDllBase;
@@ -145,15 +149,18 @@ uintptr_t NtDllBase;
 uint32_t* NtDllRedirectionLUT;
 uint32_t NtDllRedirectionLUTSize;
 
-// Wine doesn't support issuing direct system calls with SVC, and unlike Windows it doesn't have a 'stable' syscall number for NtContinue
+// Wine doesn't support issuing direct system calls with SVC, and like Windows it also doesn't have 'stable' syscall numbers
 void* WineSyscallDispatcher;
 uint64_t WineNtContinueSyscallId;
 uint64_t WineNtAllocateVirtualMemorySyscallId;
 uint64_t WineNtProtectVirtualMemorySyscallId;
+uint64_t WineNtRaiseExceptionSyscallId;
 
 NTSTATUS NtContinueNative(ARM64_NT_CONTEXT* NativeContext, BOOLEAN Alert);
 NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
 NTSTATUS NtProtectVirtualMemoryNative(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG*);
+NTSTATUS NtRaiseExceptionNative(EXCEPTION_RECORD*, ARM64_NT_CONTEXT*, BOOL);
+static fextl::string AppConfigName {};
 
 [[noreturn]]
 void JumpSetStack(uintptr_t PC, uintptr_t SP);
@@ -196,7 +203,10 @@ struct ThreadCPUArea {
 };
 
 struct FrontendThreadData {
+  FEX::Windows::ScopedHandle ThreadHandle;
   bool InLockedRWXRead {};
+  FrontendThreadData(FEX::Windows::ScopedHandle&& ThreadHandle)
+    : ThreadHandle {std::move(ThreadHandle)} {}
 };
 
 namespace {
@@ -421,28 +431,87 @@ void ParseWineSyscallNumbers(HMODULE NtDll) {
       WineNtAllocateVirtualMemorySyscallId = CurSyscallId;
     } else if (strcmp(it->Name, "NtProtectVirtualMemory") == 0) {
       WineNtProtectVirtualMemorySyscallId = CurSyscallId;
+    } else if (strcmp(it->Name, "NtRaiseException") == 0) {
+      WineNtRaiseExceptionSyscallId = CurSyscallId;
     }
   }
+}
+
+uint64_t GetNTSyscallNo(HMODULE NtDll, const char* ExportName) {
+  ULONG LoadConfigSize;
+  const _IMAGE_LOAD_CONFIG_DIRECTORY64* NtDllLoadConfig = reinterpret_cast<_IMAGE_LOAD_CONFIG_DIRECTORY64*>(
+    RtlImageDirectoryEntryToData(NtDll, true, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &LoadConfigSize));
+
+  const IMAGE_ARM64EC_METADATA* NtDllARM64ECMetadata = reinterpret_cast<IMAGE_ARM64EC_METADATA*>(NtDllLoadConfig->CHPEMetadataPointer);
+
+  // This redirection table stores a mapping from x64 entry points for fast forward sequences,
+  // to the real ARM64EC implementation of the function.
+  const IMAGE_ARM64EC_REDIRECTION_ENTRY* RedirectionTableBegin =
+    reinterpret_cast<IMAGE_ARM64EC_REDIRECTION_ENTRY*>(NtDllBase + NtDllARM64ECMetadata->RedirectionMetadata);
+  const IMAGE_ARM64EC_REDIRECTION_ENTRY* RedirectionTableEnd = RedirectionTableBegin + NtDllARM64ECMetadata->RedirectionMetadataCount;
+
+  // Walk through the table until we find an entry matching the x64 FFS.
+  const uintptr_t x64FFS = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, ExportName)) - NtDllBase;
+  uintptr_t ARM64ECImplementation = 0;
+  for (const IMAGE_ARM64EC_REDIRECTION_ENTRY* RedirectionEntry = RedirectionTableBegin; RedirectionEntry != RedirectionTableEnd;
+       RedirectionEntry++) {
+    if (RedirectionEntry->Source == x64FFS) {
+      ARM64ECImplementation = NtDllBase + RedirectionEntry->Destination;
+      break;
+    }
+  }
+
+  // Now walk through the syscall FFS table and find which entry points to the ARM64EC implementation
+  // we found in the previous table. The index of this entry in that table will be the syscall number.
+  const uintptr_t* SyscallImplementationTable = reinterpret_cast<uintptr_t*>(GetProcAddress(NtDll, "__arm64ec_syscall_ffs"));
+  const uint32_t* SyscallImplementationCount = reinterpret_cast<uint32_t*>(GetProcAddress(NtDll, "__arm64ec_syscall_ffs_size"));
+  if (!ARM64ECImplementation || !SyscallImplementationTable || !SyscallImplementationCount) {
+    return -1;
+  }
+
+  for (uint64_t SyscallNo = 0; SyscallNo < *SyscallImplementationCount; SyscallNo++) {
+    if (SyscallImplementationTable[SyscallNo] == ARM64ECImplementation) {
+      return SyscallNo;
+    }
+  }
+  return -1;
 }
 
 // Syscall thunks may have been patched before FEX has loaded, the default call checker installed by ntdll into FEX will
 // try to invoke the JIT when calling such patched syscalls but this obviously doesn't work before FEX is initalised.
 // This function parses ntdll and sets up a custom call checker to prevent this, as such it must avoid using any syscall
 // thunks itself.
-void InitSyscalls() {
+bool InitSyscalls() {
   // The ntdll exports called by GetModuleHandle/GetProcAddress aren't known to be patched before JIT init by any current
   // software so are safe to call, but if that changes the loader structures in the PEB could be parsed manually.
-  const auto NtDll = GetModuleHandle("ntdll.dll");
+  const auto NtDll = GetModuleHandleW(L"ntdll.dll");
   NtDllBase = reinterpret_cast<uintptr_t>(NtDll);
 
   const auto WineSyscallDispatcherPtr = reinterpret_cast<void**>(GetProcAddress(NtDll, "__wine_syscall_dispatcher"));
   if (WineSyscallDispatcherPtr) {
     WineSyscallDispatcher = *WineSyscallDispatcherPtr;
     ParseWineSyscallNumbers(NtDll);
+  } else {
+    // NT syscall numbers may change between versions, so we need to find the numbers
+    // for the syscalls we need ahead of time.
+    WineNtContinueSyscallId = GetNTSyscallNo(NtDll, "NtContinue");
+    WineNtAllocateVirtualMemorySyscallId = GetNTSyscallNo(NtDll, "NtAllocateVirtualMemory");
+    WineNtProtectVirtualMemorySyscallId = GetNTSyscallNo(NtDll, "NtProtectVirtualMemory");
+    WineNtRaiseExceptionSyscallId = GetNTSyscallNo(NtDll, "NtRaiseException");
+
+    // Fail if the syscall number we found is beyond the bounds
+    // of our static table. This is almost certainly not going
+    // to happen, but failing here will make debugging easier later on.
+    const uint64_t SyscallTableSize = SyscallTableEnd - SyscallTable;
+    if (std::max({WineNtContinueSyscallId, WineNtAllocateVirtualMemorySyscallId, WineNtProtectVirtualMemorySyscallId,
+                  WineNtRaiseExceptionSyscallId}) >= SyscallTableSize) {
+      return false;
+    }
   }
 
   FillNtDllLUTs(NtDll);
   PatchCallChecker();
+  return true;
 }
 
 void HandleImageMap(uint64_t Address, bool MainImage = false) {
@@ -588,6 +657,67 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
     State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (Context.FltSave.StatusWord >> 11) & 0b111;
     State.AbridgedFTW = Context.FltSave.TagWord;
   }
+
+  // TODO: These are super incorrect for debug registers.
+  if constexpr (false) {
+    if ((Context.ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS) {
+      // If any of the debug register state changed then we need to invalidate.
+      const bool Dr0Changed = (Context.Dr0 != State.Dr[0]) || ((Context.Dr7 ^ State.Dr7) & ((0b1111 << 16) | (0b11 << 0)));
+      const bool Dr1Changed = (Context.Dr1 != State.Dr[1]) || ((Context.Dr7 ^ State.Dr7) & ((0b1111 << 20) | (0b11 << 2)));
+      const bool Dr2Changed = (Context.Dr2 != State.Dr[2]) || ((Context.Dr7 ^ State.Dr7) & ((0b1111 << 24) | (0b11 << 4)));
+      const bool Dr3Changed = (Context.Dr3 != State.Dr[3]) || ((Context.Dr7 ^ State.Dr7) & ((0b1111 << 28) | (0b11 << 6)));
+
+      if (Dr0Changed || Dr1Changed || Dr2Changed || Dr3Changed) {
+        std::scoped_lock Lock(ThreadCreationMutex);
+        // Need to clear both context and state addresses if changed.
+        // Only if the BP type was instruction class.
+        if (Dr0Changed) {
+          if (Context.Dr0 && ((Context.Dr7 >> 16) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(Context.Dr0, 8, false);
+          }
+
+          if (State.Dr[0] && ((State.Dr7 >> 16) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[0], 8, false);
+          }
+        }
+        if (Dr1Changed) {
+          if (Context.Dr1 && ((Context.Dr7 >> 20) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(Context.Dr1, 8, false);
+          }
+
+          if (State.Dr[1] && ((State.Dr7 >> 20) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[1], 8, false);
+          }
+        }
+        if (Dr2Changed) {
+          if (Context.Dr2 && ((Context.Dr7 >> 24) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(Context.Dr2, 8, false);
+          }
+
+          if (State.Dr[2] && ((State.Dr7 >> 24) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[2], 8, false);
+          }
+        }
+        if (Dr3Changed) {
+          if (Context.Dr3 && ((Context.Dr7 >> 28) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(Context.Dr3, 8, false);
+          }
+
+          if (State.Dr[3] && ((State.Dr7 >> 28) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[3], 8, false);
+          }
+        }
+      }
+
+      // Update context now that we have invalidated.
+      State.Dr[0] = Context.Dr0;
+      State.Dr[1] = Context.Dr1;
+      State.Dr[2] = Context.Dr2;
+      State.Dr[3] = Context.Dr3;
+      State.Dr6 = Context.Dr6;
+      State.Dr7 = Context.Dr7;
+    }
+  }
 }
 
 static void ReconstructThreadState(FEXCore::Core::InternalThreadState* Thread, ARM64_NT_CONTEXT& Context) {
@@ -609,6 +739,16 @@ static void ReconstructThreadState(FEXCore::Core::InternalThreadState* Thread, A
   // Spill EFlags
   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, true, Context.X, Context.Cpsr);
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+
+  // TODO: These are super incorrect for debug registers.
+  if constexpr (false) {
+    State.Dr[0] = Context.Bvr[0];
+    State.Dr[1] = Context.Bvr[1];
+    State.Dr[2] = Context.Bvr[2];
+    State.Dr[3] = Context.Bvr[3];
+    State.Dr6 = Context.Bcr[0];
+    State.Dr7 = Context.Bcr[1];
+  }
 }
 
 // Reconstructs an x64 context from the input thread's state, packed into a regular ARM64 context following the ARM64EC register mapping
@@ -616,11 +756,6 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ARM64_NT_CONTEXT ECContext {};
 
   ECContext.ContextFlags = CONTEXT_ARM64_FULL;
-  if (CPUFeatures->IsFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE)) {
-    // This is a FEX extension and requires corresponding wine-side patches to be of use, however it is harmless to set
-    // even if those patches are not used.
-    ECContext.ContextFlags |= CONTEXT_ARM64_FEX_YMMSTATE;
-  }
 
   auto& State = Thread->CurrentFrame->State;
 
@@ -677,22 +812,23 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ECContext.Fpcr = FPCR;
   ECContext.Fpsr = FPSR;
 
+  // TODO: These are super incorrect for debug registers.
+  if constexpr (false) {
+    // Debug registers
+    ECContext.Bvr[0] = State.Dr[0];
+    ECContext.Bvr[1] = State.Dr[1];
+    ECContext.Bvr[2] = State.Dr[2];
+    ECContext.Bvr[3] = State.Dr[3];
+    ECContext.Bcr[0] = State.Dr6;
+    ECContext.Bcr[1] = State.Dr7;
+  }
+
   return ECContext;
 }
 
-static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
-  const auto& Config = SignalDelegator->GetConfig();
-  auto* Thread = GetCPUArea().ThreadState();
+static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext,
+                           ARM64_NT_CONTEXT* HostContext = nullptr) {
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-  uint64_t GuestSp = Context.X[Config.SRAGPRMapping[static_cast<size_t>(FEXCore::X86State::REG_RSP)]];
-  auto* Args = reinterpret_cast<KiUserExceptionDispatcherStackLayout*>(FEXCore::AlignDown(GuestSp, 64)) - 1;
-
-  LogMan::Msg::DFmt("Reconstructing context");
-  if (!IsDispatcherAddress(Context.Pc)) {
-    ReconstructThreadState(Thread, Context);
-  }
-  Args->Context = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
-  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, Args->Context.Pc);
 
 #ifdef FEX_IOS_HOST
   // ml341: same gap as #52 but on the exception path — the reconstructed rip can be a
@@ -702,12 +838,12 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   // every module) and the process dies on an otherwise-survivable fault. Reverse-translate
   // via the alias table (the only valid discriminator — never a band test).
   {
-    const uint64_t PeRip = IosJitReverseTranslate(Args->Context.Pc);
-    if (PeRip != Args->Context.Pc) {
+    const uint64_t PeRip = IosJitReverseTranslate(GuestContext.Pc);
+    if (PeRip != GuestContext.Pc) {
       LogMan::Msg::EFmt("[exc-pool-rip] rev=ml341 reconstructed guest rip {:#x} is a POOL-COPY alias of PE {:#x} "
                         "-- rewriting so guest SEH can resolve the faulting module",
-                        Args->Context.Pc, PeRip);
-      Args->Context.Pc = PeRip;
+                        GuestContext.Pc, PeRip);
+      GuestContext.Pc = PeRip;
     }
   }
 #endif
@@ -719,25 +855,67 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
 
-  Args->Rec = FEX::Windows::HandleGuestException(Fault, Rec, Args->Context.Pc, Args->Context.X8, Args->Context.X0);
-  if (Args->Rec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
-    Args->Context.Cpsr &= ~(1 << 21); // PSTATE.SS
-  } else if (Args->Rec.ExceptionCode == EXCEPTION_BREAKPOINT) {
+  BOOL FirstChance = TRUE;
+  EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
+  if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+    GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
+  } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
     // INT3 will set RIP to the instruction following it, undo this (any edge cases with multibyte instructions that trigger breakpoints are bugs present in Windows also)
-    Args->Context.Pc -= 1;
+    GuestContext.Pc -= 1;
   }
 
-  Context.Sp = reinterpret_cast<uint64_t>(Args);
-  Context.Pc = KiUserExceptionDispatcher;
+#ifdef FEX_IOS_HOST
+  if (FirstChance) {
+    if (HostContext) {
+      const auto& Config = SignalDelegator->GetConfig();
+      uint64_t GuestSp = HostContext->X[Config.SRAGPRMapping[static_cast<size_t>(FEXCore::X86State::REG_RSP)]];
+      auto* Args = reinterpret_cast<KiUserExceptionDispatcherStackLayout*>(FEXCore::AlignDown(GuestSp, 64)) - 1;
+      Args->Context = GuestContext;
+      Args->Rec = GuestRec;
+      HostContext->Sp = reinterpret_cast<uint64_t>(Args);
+      HostContext->Pc = KiUserExceptionDispatcher;
+      return;
+    } else {
+      KiUserExceptionDispatcherStackLayout DispatchArgs {.Context = GuestContext, .Rec = GuestRec};
+      JumpSetStack(KiUserExceptionDispatcher, reinterpret_cast<uintptr_t>(&DispatchArgs));
+    }
+  }
+#endif
+  NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
+}
+
+static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& HostContext) {
+  LogMan::Msg::DFmt("Reconstructing context");
+  if (!IsDispatcherAddress(HostContext.Pc)) {
+    ReconstructThreadState(Thread, HostContext);
+  }
+  auto GuestContext = StoreStateToPackedECContext(Thread, HostContext.Fpcr, HostContext.Fpsr);
+  LogMan::Msg::DFmt("pc: {:X} rip: {:X}", HostContext.Pc, GuestContext.Pc);
+
+  RaiseException(Thread, Rec, GuestContext, &HostContext);
+}
+
+[[noreturn]]
+static void SynchronousExceptionHandler(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {
+  // Coming in to this function, the guest state is synchronized and the host thread is in a safe location.
+  auto Thread = Frame->Thread;
+
+  uint64_t FPCR, FPSR;
+  __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
+  __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
+
+  auto Context = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
+  EXCEPTION_RECORD Record = FEX::Windows::ReconstructExceptionRecordFromSynchronousFault(Thread->CurrentFrame->SynchronousFaultData);
+
+  RaiseException(Thread, Record, Context);
+  ERROR_AND_DIE_FMT("This should always noreturn");
 }
 
 class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
 public:
-  ECSyscallHandler() {
-    OSABI = FEXCore::HLE::SyscallOSABI::OS_GENERIC;
-  }
+  ECSyscallHandler() = default;
 
-  uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args) override {
+  void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     ProcessPendingCrossProcessEmulatorWork();
 
     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
@@ -982,22 +1160,28 @@ NTSTATUS ProcessInit() {
   }
 #endif
 
-  InitSyscalls();
+  if (!InitSyscalls()) {
+    return STATUS_NOT_SUPPORTED;
+  }
 
   FEX::Windows::InitCRTProcess();
-  const auto ExecutableName = FEX::Windows::BaseName(FEX::Windows::GetExecutableFilePath());
-  FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
+  FEX::Windows::SetupThreadHandlers();
+  const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
+  AppConfigName = FEX::Windows::BaseName(ExecutablePath);
+  FEX::Config::LoadConfig(AppConfigName, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_FILENAME, ExecutablePath);
+  FEXCore::Config::Set(FEXCore::Config::CONFIG_APP_CONFIG_NAME, AppConfigName);
 
 #ifdef FEX_IOS_HOST
   /* Recorder emitted only for this executable, before CTX/JIT creation. */
-  const auto HistoryName = fextl::string {ExecutableName};
+  const auto HistoryName = fextl::string {AppConfigName};
   const char* HistoryOpt = getenv("MADEIRA_FEX_BRANCH_HISTORY");
   FEXCore::Core::IosGuestBranchTraceEnabled =
     _stricmp(HistoryName.c_str(), "Launcher.exe") == 0 && !(HistoryOpt && HistoryOpt[0] == '0');
   LogMan::Msg::IFmt("FEX: branch-history-v1 madeira-bcd enabled={} exe={}",
-                   FEXCore::Core::IosGuestBranchTraceEnabled != 0, ExecutableName);
+                   FEXCore::Core::IosGuestBranchTraceEnabled != 0, AppConfigName);
 #endif
 
 
@@ -1091,7 +1275,7 @@ NTSTATUS ProcessInit() {
   SignalDelegator = fextl::make_unique<FEX::DummyHandlers::DummySignalDelegator>();
   SyscallHandler = fextl::make_unique<Exception::ECSyscallHandler>();
 
-  const auto NtDll = GetModuleHandle("ntdll.dll");
+  const auto NtDll = GetModuleHandleW(L"ntdll.dll");
   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
   OvercommitTracker.emplace(IsWine);
 
@@ -1099,9 +1283,13 @@ NTSTATUS ProcessInit() {
 
   FEX::Windows::Allocator::SetupHooks(NtDll);
   FEX::Windows::UnixLib::Init(NtDll);
+  if (FEX::Windows::UnixLib::Available()) {
+    FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
+  }
 
   {
-    auto HostFeatures = FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec);
+    auto HostFeatures =
+      FEX::Windows::CPUFeatures::FetchHostFeatures(IsWine, FEXCore::HostFeatures::HostTypeEnum::Arm64ec, FEX::Windows::UnixLib::GetPID());
     CTX = FEXCore::Context::Context::CreateNewContext(HostFeatures);
 #ifdef FEX_IOS_HOST
     /* ExitFunctionECJit (Module.S) leaves out ExitFunctionEC's FPCR test, so it is used only without AFP,
@@ -1305,17 +1493,74 @@ NTSTATUS ProcessInit() {
     StatAllocHandler = fextl::make_unique<FEX::Windows::StatAlloc>(FEXCore::SHMStats::AppType::WIN_ARM64EC);
   }
 
-  if (StartupSleep() && (StartupSleepProcName().empty() || ExecutableName == StartupSleepProcName())) {
-    LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), ExecutableName, StartupSleep());
+  if (StartupSleep() && (StartupSleepProcName().empty() || AppConfigName == StartupSleepProcName())) {
+    LogMan::Msg::IFmt("[{}][{}] Sleeping for {} seconds", GetCurrentProcessId(), AppConfigName, StartupSleep());
     std::this_thread::sleep_for(std::chrono::seconds(StartupSleep()));
   }
 
   return STATUS_SUCCESS;
 }
 
+#ifdef FEX_IOS_HOST
 void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
   if (!After) {
     ProcessTerminating.store(true, std::memory_order_relaxed);
+  }
+}
+#else
+static void SuspendAllThreads() {
+  // Pulse suspending with lock to ensure threads exit.
+  const auto CurrentThread = GetCurrentThreadId();
+  while (true) {
+    bool AllSuspended = true;
+    {
+      // Hold the thread creation mutex so none are created while we're suspending.
+      std::scoped_lock Lock(ThreadCreationMutex);
+      for (auto& Thread : Threads) {
+        bool Self = Thread.first == CurrentThread;
+        if (Self) {
+          // Don't suspend self.
+          continue;
+        }
+
+        auto FrontendData = GetFrontendThreadData(Thread.second);
+        ULONG SuspendCount {};
+        RtlWow64SuspendThread(*FrontendData->ThreadHandle, &SuspendCount);
+
+        if (SuspendCount != 0) {
+          // This will wait for the thread to be suspended. Only execute if we know the thread /should/ be suspended.
+          // SuspendCount may saturate to max, but we don't care here.
+          CONTEXT TmpContext;
+          TmpContext.ContextFlags = CONTEXT_CONTROL;
+          NtGetContextThread(*FrontendData->ThreadHandle, &TmpContext);
+        } else {
+          // Wasn't suspended.
+          AllSuspended = false;
+        }
+      }
+    }
+
+    if (AllSuspended) {
+      // All threads suspended, free to continue.
+      break;
+    }
+
+    // Wait a second to let threads catch up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
+void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
+  if (After == false) {
+    // Someone called `NtTerminateProcess`. It is FEX's responsibility to spin down the threads in this moment.
+    // After we return from this, WINE will start indiscriminately killing threads with SIGQUIT.
+    // If we don't stop them now, then locks will be held by dead threads while the final process thread is trying to finish.
+    // This isn't 100% correct since another process calling `NtTerminateProcess` on our current process will SIGQUIT without warning.
+    // We need WINE patches to capture this properly.
+    SuspendAllThreads();
+  }
+}
+#endif
   }
 }
 
@@ -1536,6 +1781,11 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     return true;
   }
 
+  if (NativeContext->Pc == reinterpret_cast<uint64_t>(&FEXCore::Assert::ForcedAssert)) {
+    LogMan::Msg::DFmt("FEX: Forced assert");
+    NtTerminateProcess(NtCurrentProcess(), 0x42);
+  }
+
   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
     LogMan::Msg::DFmt("Passing through exception");
     return false;
@@ -1553,7 +1803,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
   }
 
   if (IsEmulatorStackAddress(CPUArea, reinterpret_cast<uint64_t>(__builtin_frame_address(0)))) {
-    Exception::RethrowGuestException(*Exception, *NativeContext);
+    Exception::RethrowGuestException(Thread, *Exception, *NativeContext);
     LogMan::Msg::DFmt("Rethrowing onto guest stack: {:X}", NativeContext->Sp);
     return true;
   } else {
@@ -1570,7 +1820,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
                        (uint64_t)__builtin_frame_address(0),
                        CPUArea.EmulatorStackLimit(),
                        CPUArea.EmulatorStackBase());
-    Exception::RethrowGuestException(*Exception, *NativeContext);
+    Exception::RethrowGuestException(Thread, *Exception, *NativeContext);
     return true;
 #else
     LogMan::Msg::EFmt("Unexpected exception in JIT code on guest stack");
@@ -1617,6 +1867,70 @@ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestConte
     NtContinueNative(NativeContext, false);
   }
 
+  // TODO: These are super incorrect for debug registers.
+  if constexpr (false) {
+    auto Thread = CPUArea.ThreadState();
+    auto& State = Thread->CurrentFrame->State;
+
+    if ((GuestContext->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS) {
+      // If any of the debug register state changed then we need to invalidate.
+      const bool Dr0Changed = (GuestContext->Dr0 != State.Dr[0]) || ((GuestContext->Dr7 ^ State.Dr7) & ((0b1111 << 16) | (0b11 << 0)));
+      const bool Dr1Changed = (GuestContext->Dr1 != State.Dr[1]) || ((GuestContext->Dr7 ^ State.Dr7) & ((0b1111 << 20) | (0b11 << 2)));
+      const bool Dr2Changed = (GuestContext->Dr2 != State.Dr[2]) || ((GuestContext->Dr7 ^ State.Dr7) & ((0b1111 << 24) | (0b11 << 4)));
+      const bool Dr3Changed = (GuestContext->Dr3 != State.Dr[3]) || ((GuestContext->Dr7 ^ State.Dr7) & ((0b1111 << 28) | (0b11 << 6)));
+
+      if (Dr0Changed || Dr1Changed || Dr2Changed || Dr3Changed) {
+        std::scoped_lock Lock(ThreadCreationMutex);
+        // Need to clear both context and state addresses if changed.
+        // Only if the BP type was instruction class.
+        if (Dr0Changed) {
+          if (GuestContext->Dr0 && ((GuestContext->Dr7 >> 16) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(GuestContext->Dr0, 8, false);
+          }
+
+          if (State.Dr[0] && ((State.Dr7 >> 16) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[0], 8, false);
+          }
+        }
+        if (Dr1Changed) {
+          if (GuestContext->Dr1 && ((GuestContext->Dr7 >> 20) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(GuestContext->Dr1, 8, false);
+          }
+
+          if (State.Dr[1] && ((State.Dr7 >> 20) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[1], 8, false);
+          }
+        }
+        if (Dr2Changed) {
+          if (GuestContext->Dr2 && ((GuestContext->Dr7 >> 24) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(GuestContext->Dr2, 8, false);
+          }
+
+          if (State.Dr[2] && ((State.Dr7 >> 24) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[2], 8, false);
+          }
+        }
+        if (Dr3Changed) {
+          if (GuestContext->Dr3 && ((GuestContext->Dr7 >> 28) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(GuestContext->Dr3, 8, false);
+          }
+
+          if (State.Dr[3] && ((State.Dr7 >> 28) & 0b11) == 0) {
+            InvalidationTracker->InvalidateAlignedInterval(State.Dr[3], 8, false);
+          }
+        }
+      }
+
+      // Update context now that we have invalidated.
+      State.Dr[0] = GuestContext->Dr0;
+      State.Dr[1] = GuestContext->Dr1;
+      State.Dr[2] = GuestContext->Dr2;
+      State.Dr[3] = GuestContext->Dr3;
+      State.Dr6 = GuestContext->Dr6;
+      State.Dr7 = GuestContext->Dr7;
+    }
+  }
+
   CPUArea.Area->InSimulation = false;
   CPUArea.Area->InSyscallCallback = false;
   return STATUS_SUCCESS;
@@ -1640,9 +1954,18 @@ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL 
     return;
   }
 
-  if (After) {
-    // MEM_RESET(_UNDO) ignores the passed permissions
-    if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
+  if (!After) {
+    ThreadCreationMutex.lock();
+  } else {
+    // MEM_RESET(_UNDO) ignores the passed permissions.
+    // MEM_RESERVE doesn't actually allow anything to use the memory.
+    const bool WasSuccess = Status == STATUS_SUCCESS;
+    const bool IsNotReset = (Type & (MEM_RESET | MEM_RESET_UNDO)) == 0;
+    // (Type & MEM_COMMIT) = Need to track
+    // (Type & (MEM_COMMIT | MEM_RESERVE)) = Need to track
+    // (TYPE & MEM_RESERVE) = No need to track
+    const bool IsNotReserveWithoutCommit = (Type & (MEM_COMMIT | MEM_RESERVE)) != MEM_RESERVE;
+    if (WasSuccess && IsNotReset && IsNotReserveWithoutCommit) {
       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
     }
   }
@@ -1875,6 +2198,7 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
     return;
   }
 
+#ifdef FEX_IOS_HOST
   if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !ThreadState) {
     return;
   }
@@ -1887,6 +2211,55 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
   } else {
     CTX->GetCodeInvalidationMutex().unlock();
     ThreadCreationMutex.unlock();
+    }
+  }
+#else
+  // On file read this can cause JIT code invalidations. FEX previously used to hold locks on `CodeInvalidationMutex` and `ThreadCreationMutex` during
+  // this. This was a problem that file reads are blocking and may necessarily never return. A simple unit-test that holds a blocking read, then tries
+  // to create threads or JIT code would immediately hang.
+  //
+  // - PhysX msiexec installer (From Dishonored AppID 205100) did exactly this and hung forever.
+  //
+  // The alternative approach is to let the read progress as normal and only notify invalidation when the read actually returns. This introduces an
+  // unavoidable race which by my logic is fine.
+  //
+  // 1) If a thread is already jitting code from the address range then in a "real" x86 environment it may see old, new, or a combination of both.
+  //   - NtReadFile isn't guaranteed to return new data atomically, in order, or anything of the sort.
+  // 2) The calling thread only ever sees the before code, and the after code because `NtReadFile` never leaves "kernel" space before invalidation.
+  //
+  // The only "gotcha" is that FEX could have write-protected the memory region when a JIT executed the code, and once the `NtReadFile` tries
+  // returning data, it faults. This requires coordination between Wine and FEX in order to handle this edge case.
+  //
+  // Additionally, async reads are still completely untracked with invalidation, which never worked before anyway.
+
+  if (AppConfigName == "P5R.exe") {
+    // Use the locking mechanism for (Persona 5 Royal AppID 1687950) which does exactly the problem described above.
+    auto& InLockedRWXRead = GetFrontendThreadData(ThreadState)->InLockedRWXRead;
+    if (!After) {
+      ThreadCreationMutex.lock();
+      CTX->GetCodeInvalidationMutex().lock();
+      if (InvalidationTracker->BeginUntrackedWriteLocked(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size))) {
+        InLockedRWXRead = true;
+      } else {
+        CTX->GetCodeInvalidationMutex().unlock();
+        ThreadCreationMutex.unlock();
+      }
+    } else {
+      if (InLockedRWXRead) {
+        InLockedRWXRead = false;
+        CTX->GetCodeInvalidationMutex().unlock();
+        ThreadCreationMutex.unlock();
+      }
+    }
+
+    return;
+  }
+
+  if (After && Status == STATUS_SUCCESS) {
+    std::scoped_lock Lock(ThreadCreationMutex);
+    InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+  }
+#endif
   }
 }
 
@@ -2055,7 +2428,7 @@ NTSTATUS ThreadInit() {
   IosTiLog("[FEX-iOS] TI:stack\n");
 #endif
 
-  auto* Thread = CTX->CreateThread(0, 0);
+  auto* Thread = CTX->CreateThread();
   if (!Thread) {
     /* The emulator could not allocate this thread's state. Unwind what this
      * function has already built and hand the failure back; the loader releases
@@ -2186,6 +2559,7 @@ NTSTATUS ThreadInit() {
 #else
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
 #endif
+  Thread->CurrentFrame->Pointers.SynchronousExceptionHandler = reinterpret_cast<uintptr_t>(&Exception::SynchronousExceptionHandler);
   CPUArea.StateFrame() = Thread->CurrentFrame;
 
   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
@@ -2391,7 +2765,7 @@ NTSTATUS ThreadInit() {
   uint64_t EnterECFillSRA = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterECFillSRA;
   CPUArea.DispatcherLoopTopEnterECFillSRA() = EnterECFillSRA;
 
-  CPUArea.ContextAmd64() = {.ContextFlags = CONTEXT_CONTROL | CONTEXT_SEGMENTS | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT,
+  CPUArea.ContextAmd64() = {.ContextFlags = CONTEXT_CONTROL | CONTEXT_SEGMENTS | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS,
                             .AMD64_SegCs = (FEXCore::Core::CPUState::DEFAULT_USER_CS << 3) | 3,
                             .AMD64_SegDs = 0x2b,
                             .AMD64_SegEs = 0x2b,
@@ -2404,7 +2778,8 @@ NTSTATUS ThreadInit() {
                             .AMD64_ControlWord = 0x27f};
   Exception::LoadStateFromECContext(Thread, CPUArea.ContextAmd64().AMD64_Context);
 
-  Thread->FrontendPtr = new FrontendThreadData();
+  Thread->FrontendPtr =
+    new FrontendThreadData(FEX::Windows::DupHandle(GetCurrentThread(), THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT));
 
   {
     auto ThreadTID = GetCurrentThreadId();
@@ -2463,7 +2838,7 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
     return STATUS_ACCESS_DENIED;
   }
 
-  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME);
+  auto ThreadDup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT);
 
   THREAD_BASIC_INFORMATION Info;
   if (auto Err = NtQueryInformationThread(*ThreadDup, ThreadBasicInformation, &Info, sizeof(Info), nullptr); Err) {
@@ -2478,6 +2853,7 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
     // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
     NtSuspendThread(*ThreadDup, NULL);
     // This will wait for the thread to be suspended
+    TmpContext.ContextFlags = CONTEXT_CONTROL;
     NtGetContextThread(*ThreadDup, &TmpContext);
   }
 

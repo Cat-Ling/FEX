@@ -9,9 +9,31 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 
 namespace FEX::Windows {
+
+static inline EXCEPTION_RECORD ReconstructExceptionRecordFromSynchronousFault(FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& Fault) {
+  LOGMAN_THROW_A_FMT(Fault.FaultToTopAndGeneratedException, "Can't reconstruct ExceptionRecord without synchronous fault!");
+  EXCEPTION_RECORD Record = {};
+
+  // Need to translate exception record in synchronous fault handler.
+  switch (Fault.Signal) {
+  case FEXCore::Core::FAULT_SIGILL: Record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION; break;
+  case FEXCore::Core::FAULT_SIGTRAP:
+    switch (Fault.TrapNo) {
+    case FEXCore::X86State::X86_TRAPNO_DB: Record.ExceptionCode = EXCEPTION_SINGLE_STEP; break;
+    case FEXCore::X86State::X86_TRAPNO_BP: Record.ExceptionCode = EXCEPTION_BREAKPOINT; break;
+    default: LogMan::Msg::EFmt("Unknown SIGTRAP trap: {}", Fault.TrapNo); break;
+    }
+    break;
+  case FEXCore::Core::FAULT_SIGSEGV: Record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION; break;
+  default: ERROR_AND_DIE_FMT("Unknown fault signal"); break;
+  }
+
+  return Record;
+}
+
 template<typename TReg>
 static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& Fault,
-                                                    const EXCEPTION_RECORD& Src, TReg& Rip, TReg Rax, TReg Cx) {
+                                                    const EXCEPTION_RECORD& Src, TReg& Rip, TReg Rax, TReg Cx, BOOL& FirstChance) {
   EXCEPTION_RECORD Dst = Src;
   Dst.ExceptionAddress = reinterpret_cast<void*>(Rip);
 
@@ -42,12 +64,22 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
     case FEXCore::X86State::X86_TRAPNO_GP:
       if ((Fault.err_code & 0b111) == 0b010) {
         switch (Fault.err_code >> 3) {
+        case 3:
+          Rip += 2;
+          Dst.ExceptionAddress = reinterpret_cast<void*>(Rip - 1);
+          Dst.ExceptionCode = EXCEPTION_BREAKPOINT;
+          Dst.NumberParameters = 1;
+          Dst.ExceptionInformation[0] = 0;
+          return Dst;
         case 0x29:
           Dst.ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
+          Dst.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
           Dst.ExceptionAddress = reinterpret_cast<void*>(Rip);
           Dst.NumberParameters = 1;
           Dst.ExceptionInformation[0] = Cx;
+          FirstChance = FALSE;
           return Dst;
+        case 0x2c: Dst.ExceptionCode = STATUS_ASSERTION_FAILURE; return Dst;
         case 0x2d:
           Rip += 3;
           Dst.ExceptionCode = EXCEPTION_BREAKPOINT;
@@ -69,7 +101,7 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
       // A page-fault raised by an explicit break in JIT code is always an execute fault
       Dst.NumberParameters = 2;
       Dst.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
-      Dst.ExceptionInformation[1] = Rip;
+      Dst.ExceptionInformation[1] = Fault.FaultAddress ? Fault.FaultAddress : Rip;
       return Dst;
     default: LogMan::Msg::EFmt("Unknown SIGSEGV trap: {}", Fault.TrapNo); break;
     }

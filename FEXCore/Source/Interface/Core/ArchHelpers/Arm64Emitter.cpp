@@ -409,6 +409,7 @@ namespace x32 {
 Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr, size_t size)
   : Emitter(static_cast<uint8_t*>(EmissionPtr), size)
   , EmitterCTX {ctx}
+  , SupportCodeRelocations {ctx->RequiresRelocatableConstants()}
 #ifdef VIXL_SIMULATOR
   , Simulator {&SimDecoder, stdout, vixl::aarch64::SimStack(SimulatorStackSize).Allocate()}
 #endif
@@ -498,7 +499,7 @@ void Arm64Emitter::LoadConstant(ARMEmitter::Size s, ARMEmitter::Register Reg, ui
     NOPPad = false;
   } else if (Pad == PadType::AUTOPAD) {
     // Force NOP padding to ensure relocated constants always have enough encoding space available
-    NOPPad = EnableCodeCaching;
+    NOPPad = SupportCodeRelocations;
   }
 
   bool Is64Bit = s == ARMEmitter::Size::i64Bit;
@@ -706,7 +707,7 @@ void Arm64Emitter::PopCalleeSavedRegisters() {
   }
 }
 
-void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, bool SetFIZ, bool SetPredRegs) {
+void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options) {
 #ifndef VIXL_SIMULATOR
   if (EmitterCTX->HostFeatures.SupportsAFP) {
     // Enable AFP features when filling JIT state.
@@ -722,7 +723,7 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
         (1U << 2) |   // NEP
           (1U << 1)); // AH
 
-    if (SetFIZ) {
+    if (Options.SetFIZ) {
       // Insert MXCSR.DAZ in to FIZ
       ldr(TmpReg2.W(), STATE.R(), offsetof(FEXCore::Core::CPUState, mxcsr));
       bfxil(ARMEmitter::Size::i64Bit, TmpReg, TmpReg2, 6, 1);
@@ -732,16 +733,16 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
   }
 #endif
 
-  if (SetPredRegs && EmitterCTX->HostFeatures.SupportsSVE()) {
+  if (Options.SetPredRegs && EmitterCTX->HostFeatures.SupportsSVE()) {
     // Set up predicate registers.
     // We don't bother spilling these in SpillStaticRegs,
     // since all that matters is we restore them on a fill.
     // It's not a concern if they get trounced by something else.
-    if (EmitterCTX->HostFeatures.SupportsSVE256) {
+    if (EmitterCTX->HostFeatures.SupportsSVE256()) {
       ptrue(ARMEmitter::SubRegSize::i8Bit, PRED_TMP_32B, ARMEmitter::PredicatePattern::SVE_VL32);
     }
 
-    if (EmitterCTX->HostFeatures.SupportsSVE128) {
+    if (EmitterCTX->HostFeatures.SupportsSVE128()) {
       ptrue(ARMEmitter::SubRegSize::i8Bit, PRED_TMP_16B, ARMEmitter::PredicatePattern::SVE_VL16);
     }
 
@@ -813,7 +814,7 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
   }
 
   if (Options.FPRs) {
-    if (EmitterCTX->HostFeatures.SupportsAVX && EmitterCTX->HostFeatures.SupportsSVE256) {
+    if (EmitterCTX->HostFeatures.SupportsAVX() && EmitterCTX->HostFeatures.SupportsSVE256()) {
       for (size_t i = 0; i < StaticFPRegisters.size(); i++) {
         const auto Reg = StaticFPRegisters[i];
 
@@ -912,10 +913,10 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
     msr(ARMEmitter::SystemRegister::NZCV, TmpReg);
   }
 
-  FillSpecialRegs(TmpReg, TmpReg2, true, Options.FPRs);
+  FillSpecialRegs(TmpReg, TmpReg2, {.SetFIZ = true, .SetPredRegs = Options.FPRs});
 
   if (Options.FPRs) {
-    if (EmitterCTX->HostFeatures.SupportsAVX && EmitterCTX->HostFeatures.SupportsSVE256) {
+    if (EmitterCTX->HostFeatures.SupportsAVX() && EmitterCTX->HostFeatures.SupportsSVE256()) {
       for (size_t i = 0; i < StaticFPRegisters.size(); i++) {
         const auto Reg = StaticFPRegisters[i];
         if (((1U << Reg.Idx()) & Options.FPRFillMask) != 0) {
@@ -1079,7 +1080,7 @@ void Arm64Emitter::PopGeneralRegisters(std::span<const ARMEmitter::Register> Reg
 }
 
 size_t Arm64Emitter::PushDynamicRegs(ARMEmitter::Register TmpReg) {
-  const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256;
+  const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256();
   const auto GPRSize = GeneralRegistersNotPreserved.size() * Core::CPUState::GPR_REG_SIZE;
   const auto FPRRegSize = CanUseSVE256 ? 32 : 16;
   const auto FPRSize = GeneralFPRegisters.size() * FPRRegSize;
@@ -1102,7 +1103,7 @@ size_t Arm64Emitter::PushDynamicRegs(ARMEmitter::Register TmpReg) {
 }
 
 void Arm64Emitter::PopDynamicRegs() {
-  const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256;
+  const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256();
 
   // Pop vectors first
   PopVectorRegisters(CanUseSVE256, GeneralFPRegisters);
@@ -1112,7 +1113,7 @@ void Arm64Emitter::PopDynamicRegs() {
 }
 
 size_t Arm64Emitter::SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, bool FPRs) {
-  const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256;
+  const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256();
   const auto FPRRegSize = CanUseSVE256 ? 32 : 16;
 
   std::span<const ARMEmitter::Register> DynamicGPRs {};
@@ -1149,6 +1150,7 @@ size_t Arm64Emitter::SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, boo
   SpillStaticRegs(TmpReg, {
                             .GPRSpillMask = PreserveSRAMask,
                             .FPRSpillMask = PreserveSRAFPRMask,
+                            .FPRs = FPRs,
                           });
 
   sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, SPOffset);
@@ -1166,7 +1168,7 @@ size_t Arm64Emitter::SpillForPreserveAllABICall(ARMEmitter::Register TmpReg, boo
 }
 
 void Arm64Emitter::FillForPreserveAllABICall(bool FPRs) {
-  const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256;
+  const auto CanUseSVE256 = EmitterCTX->HostFeatures.SupportsSVE256();
 
   std::span<const ARMEmitter::Register> DynamicGPRs {};
   std::span<const ARMEmitter::VRegister> DynamicFPRs {};
@@ -1211,9 +1213,15 @@ void Arm64Emitter::FillForPreserveAllABICall(bool FPRs) {
 
 void Arm64Emitter::Align16B() {
   uint64_t CurrentOffset = GetCursorAddress<uint64_t>();
+  LOGMAN_THROW_A_FMT((CurrentOffset & 3) == 0, "Can't Align16B code that isn't 4-byte aligned!");
   for (uint64_t i = (-CurrentOffset & 0xF); i != 0; i -= 4) {
     nop();
   }
+}
+
+ARMEmitter::Register Arm64Emitter::GetX86GPRMapping(FEXCore::X86State::X86Reg Reg) {
+  LOGMAN_THROW_A_FMT(Reg <= FEXCore::X86State::X86Reg::REG_R15, "Incorrect register");
+  return StaticRegisters[Reg];
 }
 
 } // namespace FEXCore::CPU

@@ -19,9 +19,11 @@
 #include <FEXCore/fextl/map.h>
 #include <FEXCore/fextl/vector.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <fmt/format.h>
+#include <span>
 #include <stddef.h>
 #include <utility>
 #include <xxhash.h>
@@ -202,13 +204,17 @@ public:
     FlushRegisterCache();
     return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode);
   }
-  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock) {
+  IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock,
+                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0) {
     FlushRegisterCache();
-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock);
+    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize);
   }
-  IRPair<IROp_Break> Break(BreakDefinition Reason) {
+  IRPair<IROp_Break> Break(BreakDefinition Reason, Ref RelocatedPC = nullptr) {
     FlushRegisterCache();
-    return _Break(Reason);
+    if (!RelocatedPC) {
+      RelocatedPC = Constant(0);
+    }
+    return _Break(Reason, RelocatedPC);
   }
   IRPair<IROp_Thunk> Thunk(Ref ArgPtr, SHA256Sum ThunkNameHash) {
     FlushRegisterCache();
@@ -216,6 +222,8 @@ public:
   }
 
   bool FinishOp(uint64_t NextRIP, bool LastOp) {
+    ++RegCache.Index;
+
     // If we are switching to a new block and this current block has yet to set a RIP
     // Then we need to insert an unconditional jump from the current block to the one we are going to
     // This happens most frequently when an instruction jumps backwards to another location
@@ -360,8 +368,10 @@ public:
   void MOVGPRNTOp(OpcodeArgs);
   void MOVVectorAlignedOp(OpcodeArgs);
   void MOVVectorUnalignedOp(OpcodeArgs);
+  void MOVVectorUnalignedNoNopOp(OpcodeArgs);
   void MOVVectorNTOp(OpcodeArgs, bool IsAVX);
-  void ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::IR::IROps AtomicFetchOp, unsigned SrcIdx);
+  void ALURAXOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp);
+  void ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::IR::IROps AtomicFetchOp, unsigned SrcIdx, bool DestRAX);
   void LSLOp(OpcodeArgs);
   void INTOp(OpcodeArgs);
   void SyscallOp(OpcodeArgs, bool IsSyscallInst);
@@ -372,8 +382,8 @@ public:
   void IRETOp(OpcodeArgs);
   void CallbackReturnOp(OpcodeArgs);
   void SecondaryALUOp(OpcodeArgs);
-  void ADCOp(OpcodeArgs, uint32_t SrcIndex);
-  void SBBOp(OpcodeArgs, uint32_t SrcIndex);
+  void ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
+  void SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void SALCOp(OpcodeArgs);
   void PUSHOp(OpcodeArgs);
   void PUSHREGOp(OpcodeArgs);
@@ -393,16 +403,18 @@ public:
   void JUMPFARIndirectOp(OpcodeArgs);
   void CALLFARIndirectOp(OpcodeArgs);
   void RETFARIndirectOp(OpcodeArgs);
-  void TESTOp(OpcodeArgs, uint32_t SrcIndex);
+  void TESTOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void ARPLOp(OpcodeArgs);
   void MOVSXDOp(OpcodeArgs);
   void MOVSXOp(OpcodeArgs);
   void MOVZXOp(OpcodeArgs);
-  void CMPOp(OpcodeArgs, uint32_t SrcIndex);
+  void CMPOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void SETccOp(OpcodeArgs);
   void CQOOp(OpcodeArgs);
   void CDQOp(OpcodeArgs);
+  std::optional<Ref> XCHGOpImpl(OpcodeArgs, Ref Src);
   void XCHGOp(OpcodeArgs);
+  void XCHGRAXOp(OpcodeArgs);
   void SAHFOp(OpcodeArgs);
   void LAHFOp(OpcodeArgs);
   void MOVSegOp(OpcodeArgs, bool ToSeg);
@@ -424,11 +436,11 @@ public:
   void RotateOp(OpcodeArgs, bool Left, bool IsImmediate, bool Is1Bit);
   void RCROp1Bit(OpcodeArgs);
   void RCROp8x1Bit(OpcodeArgs);
-  void RCROp(OpcodeArgs);
-  void RCRSmallerOp(OpcodeArgs);
+  void RCROp(OpcodeArgs, bool UseRCX);
+  void RCRSmallerOp(OpcodeArgs, bool UseRCX);
   void RCLOp1Bit(OpcodeArgs);
-  void RCLOp(OpcodeArgs);
-  void RCLSmallerOp(OpcodeArgs);
+  void RCLOp(OpcodeArgs, bool UseRCX);
+  void RCLSmallerOp(OpcodeArgs, bool UseRCX);
 
   void BTOp(OpcodeArgs, uint32_t SrcIndex, enum BTAction Action);
 
@@ -486,6 +498,7 @@ public:
   void SGDTOp(OpcodeArgs);
   void SIDTOp(OpcodeArgs);
   void SMSWOp(OpcodeArgs);
+  void SLDTOp(OpcodeArgs);
 
   enum class VectorOpType {
     MMX,
@@ -666,6 +679,8 @@ public:
 
   void VPMADDUBSWOp(OpcodeArgs);
   void VPMADDWDOp(OpcodeArgs);
+  void VPDPBUSDOp(OpcodeArgs, bool Saturating);
+  void VPDPWSSDOp(OpcodeArgs, bool Saturating);
 
   void VPMASKMOVOp(OpcodeArgs, bool IsStore);
 
@@ -742,7 +757,7 @@ public:
   void X87FLDCW(OpcodeArgs);
   void X87FNSAVE(OpcodeArgs);
   void X87FNSTENV(OpcodeArgs);
-  void X87FNSTSW(OpcodeArgs);
+  void X87FNSTSW(OpcodeArgs, bool DestRAX);
   void X87FRSTOR(OpcodeArgs);
   void X87FSTCW(OpcodeArgs);
   void X87FXAM(OpcodeArgs);
@@ -751,6 +766,7 @@ public:
   void X87LDENV(OpcodeArgs);
   void X87ModifySTP(OpcodeArgs, bool Inc);
   void X87OpHelper(OpcodeArgs, FEXCore::IR::IROps IROp, bool ZeroC2);
+  void X87NOP(OpcodeArgs);
 
   enum class FCOMIFlags {
     FLAGS_X87,
@@ -802,6 +818,7 @@ public:
   void VPFCMPOp(OpcodeArgs, uint8_t CompType);
   void PI2FWOp(OpcodeArgs);
   void PF2IWOp(OpcodeArgs);
+  void PF2IDOp(OpcodeArgs);
 
   void PMULHRWOp(OpcodeArgs);
 
@@ -823,6 +840,7 @@ public:
   void LoadFenceOrXRSTOR(OpcodeArgs);
   void MemFenceOrXSAVEOPT(OpcodeArgs);
   void StoreFenceOrCLFlush(OpcodeArgs);
+  void SerializeOp(OpcodeArgs);
   void UMonitorOrCLRSSBSY(OpcodeArgs);
   void UMWaitOp(OpcodeArgs);
   void CLZeroOp(OpcodeArgs);
@@ -842,12 +860,12 @@ public:
   void SHA256MSG2Op(OpcodeArgs);
   void SHA256RNDS2Op(OpcodeArgs);
 
-  void AESImcOp(OpcodeArgs);
+  void AESImcOp(OpcodeArgs, bool IsAVX);
   void AESEncOp(OpcodeArgs);
   void AESEncLastOp(OpcodeArgs);
   void AESDecOp(OpcodeArgs);
   void AESDecLastOp(OpcodeArgs);
-  void AESKeyGenAssist(OpcodeArgs);
+  void AESKeyGenAssist(OpcodeArgs, bool IsAVX);
 
   void VFMAImpl(OpcodeArgs, IROps IROp, bool Scalar, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
   void VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
@@ -889,7 +907,8 @@ public:
   void Extrq(OpcodeArgs);
   void Insertq(OpcodeArgs);
 
-  void BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDefinition);
+  void BreakOp(OpcodeArgs, FEXCore::IR::BreakDefinition BreakDefinition, Ref RelocatedPC = nullptr);
+  void BreakpointOp(OpcodeArgs, uint32_t BP);
   void UnimplementedOp(OpcodeArgs);
   void PermissionRestrictedOp(OpcodeArgs);
 
@@ -917,6 +936,66 @@ public:
     auto LookupIndexes =
       LoadAndCacheIndexedNamedVectorConstant(OpSize::i128Bit, FEXCore::IR::IndexNamedVectorConstant::INDEXED_NAMED_VECTOR_PSHUFD, Shuffle * 16);
     return _VTBL1(OpSize::i128Bit, Src, LookupIndexes);
+  }
+
+  // Returns true if Value == SHADataShuffle(X), and X is the result of one of Ops.
+  bool IsSHADataShuffle(Ref Value, std::span<const IROps> Ops) {
+    const Ref X = GetArgIfOp(Value, OP_VTBL1, 0);
+    if (!X) {
+      return false;
+    }
+
+    const auto XOp = GetOpHeader(WrapNode(X))->Op;
+    return std::any_of(Ops.begin(), Ops.end(), [XOp](auto Op) { return XOp == Op; });
+  }
+
+  // Helper that determine the last "real" definition of a register,
+  // following through up to a single copy. This is useful for detecting
+  // patterns necessary for some peephole optimizations.
+  Ref LastDefFollowCopy(const X86Tables::DecodedOperand& Operand) {
+    // Currently only XMM registers are supported by this helper.
+    // TODO: Support YMM, and GPRs as well when needed.
+    if (!Operand.IsGPR()) {
+      return nullptr;
+    }
+
+    const auto Reg = Operand.Data.GPR.GPR;
+    LOGMAN_THROW_A_FMT(Reg >= X86State::REG_XMM_0 && Reg <= X86State::REG_XMM_15, "LastDefFollowCopy only supports XMM registers");
+
+    const int RegisterIndex = FPR0Index + Reg - X86State::REG_XMM_0;
+    const Ref LastWrite = RegCache.LastDef[RegisterIndex];
+    const auto Header = LastWrite ? GetOpHeader(WrapNode(LastWrite)) : nullptr;
+
+    if (!Header || Header->Op != OP_LOADREGISTER) {
+      return LastWrite;
+    }
+
+    // Check if the last write was a copy of a different XMM.
+    const auto Copy = Header->C<IROp_LoadRegister>();
+    if (Copy->Class != RegClass::FPR || Copy->Reg > FPR15Index - FPR0Index) {
+      return LastWrite;
+    }
+
+    // If the last write was a copy, check if the source of the copy was written in this block,
+    // and if so, return the source instruction instead.
+    const int CopyRegister = FPR0Index + Copy->Reg;
+    const auto CopyInstructionIndex = RegCache.LastDefIndex[RegisterIndex];
+
+    if (!RegCache.LastDef[CopyRegister]) {
+      return nullptr;
+    }
+
+    if (RegCache.LastDefIndex[CopyRegister] < CopyInstructionIndex) {
+      return RegCache.LastDef[CopyRegister];
+    }
+
+    if (RegCache.LastDefIndex[CopyRegister] > CopyInstructionIndex && RegCache.PrevDef[CopyRegister] &&
+        RegCache.PrevDefIndex[CopyRegister] < CopyInstructionIndex) {
+
+      return RegCache.PrevDef[CopyRegister];
+    }
+
+    return nullptr;
   }
 
   RefPair AVX128_LoadSource_WithOpSize(const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand, uint32_t Flags,
@@ -1036,6 +1115,9 @@ public:
 
   void AVX128_VPMADDUBSW(OpcodeArgs);
   void AVX128_VPMADDWD(OpcodeArgs);
+  void AVX128_VPDPImpl(OpcodeArgs, std::function<Ref(Ref Acc, Ref Src1, Ref Src2)> Helper);
+  void AVX128_VPDPBUSD(OpcodeArgs, bool Saturating);
+  void AVX128_VPDPWSSD(OpcodeArgs, bool Saturating);
 
   void AVX128_VBLEND(OpcodeArgs, IR::OpSize ElementSize);
 
@@ -1076,13 +1158,19 @@ public:
   void AVX128_VFMAScalarImpl(OpcodeArgs, IROps IROp, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
   void AVX128_VFMAddSubImpl(OpcodeArgs, bool AddSub, uint8_t Src1Idx, uint8_t Src2Idx, uint8_t AddendIdx);
 
-  RefPair AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB);
-  RefPair AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize, RefPair Dest, RefPair Mask, RefVSIB VSIB);
+  RefPair AVX128_VPGatherQPSImpl(OpcodeArgs, Ref Dest, Ref Mask, RefVSIB VSIB, bool MaskAllOnes);
+  RefPair AVX128_VPGatherImpl(OpcodeArgs, OpSize Size, OpSize ElementLoadSize, OpSize AddrElementSize, RefPair Dest, RefPair Mask,
+                              RefVSIB VSIB, bool MaskAllOnesLow = false, bool MaskAllOnesHigh = false);
 
   void AVX128_VPGATHER(OpcodeArgs, OpSize AddrElementSize);
 
   void AVX128_VCVTPH2PS(OpcodeArgs);
   void AVX128_VCVTPS2PH(OpcodeArgs);
+  void AVX128_VBCSTNEBF162PS(OpcodeArgs);
+  void AVX128_VBCSTNESH2PS(OpcodeArgs);
+  void AVX128_VCVTNEEBF162PS(OpcodeArgs, bool Even);
+  void AVX128_VCVTNEEPH2PS(OpcodeArgs, bool Even);
+  void AVX128_VCVTNEPS2BF16(OpcodeArgs);
 
   // End of AVX 128-bit implementation
 
@@ -1117,10 +1205,16 @@ public:
   void AVXVectorUnaryOp(OpcodeArgs, IROps IROp, IR::OpSize ElementSize);
   void AVXVectorVariableBlend(OpcodeArgs, IR::OpSize ElementSize);
 
+  void AVXVBCSTNEBF162PS(OpcodeArgs);
+  void AVXVBCSTNESH2PS(OpcodeArgs);
+  void AVXVCVTNEEBF162PS(OpcodeArgs, bool Even);
+  void AVXVCVTNEEPH2PS(OpcodeArgs, bool Even);
+  void AVXVCVTNEPS2BF16(OpcodeArgs);
+
   // End of AVX 256-bit implementation
 
   void InvalidOp(OpcodeArgs);
-  void NoExecOp(OpcodeArgs);
+  void NoExecOrPartialOp(OpcodeArgs);
 
   void SetPackedRFLAG(bool Lower8, Ref Src);
   Ref GetPackedRFLAG(uint32_t FlagsMask = ~0U);
@@ -1170,6 +1264,21 @@ public:
     // At block boundaries, fix up the carry flag.
     if (!SRAOnly) {
       RectifyCarryInvert(CFInvertedABI);
+
+      // Also we can't trust the LastDef or PrevDef arrays accross block boundaries, so clear them as well.
+      for (auto& Def : RegCache.LastDef) {
+        Def = nullptr;
+      }
+      for (auto& Def : RegCache.PrevDef) {
+        Def = nullptr;
+      }
+      for (auto& DefIndex : RegCache.LastDefIndex) {
+        DefIndex = 0;
+      }
+      for (auto& DefIndex : RegCache.PrevDefIndex) {
+        DefIndex = 0;
+      }
+      RegCache.Index = 0;
     }
 
     if (!MMXOnly) {
@@ -1286,7 +1395,7 @@ protected:
       /* On ASIMD platforms, the emulation happens to preserve NZCV, unlike the
        * more optimal SVE implementation that clobbers.
        */
-      if (!CTX->HostFeatures.SupportsSVE128 && !CTX->HostFeatures.SupportsSVE256) {
+      if (!CTX->HostFeatures.SupportsSVE()) {
         return;
       }
 
@@ -1307,6 +1416,7 @@ protected:
 
 private:
   FEX_CONFIG_OPT(ReducedPrecisionMode, X87REDUCEDPRECISION);
+  FEX_CONFIG_OPT(UndefinedFlagAcidTest, UNDEFINEDFLAGACIDTEST);
 
   struct JumpTargetInfo {
     Ref BlockEntry;
@@ -1384,6 +1494,11 @@ private:
                     const X86Tables::DecodedOperand& Imm, bool IsAVX);
 
   void PCMPXSTRXOpImpl(OpcodeArgs, bool IsExplicit, bool IsMask, bool IsAVX);
+  Ref PCMPXSTRXSaturateExplicitLength(IR::OpSize ElementSize, IR::OpSize LengthSize, Ref RawLength);
+  Ref PCMPXSTRXEqualAny(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements);
+  Ref PCMPXSTRXRanges(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements, bool IsSigned);
+  Ref PCMPXSTRXEqualEach(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1ValidElements, Ref Src2ValidElements);
+  Ref PCMPXSTRXEqualOrdered(IR::OpSize ElementSize, Ref Src1, Ref Src2, Ref Src1Length, Ref Src2Length, Ref Src1ValidElements, Ref Indices);
 
   Ref PHADDSOpImpl(OpSize Size, Ref Src1, Ref Src2);
 
@@ -1399,6 +1514,10 @@ private:
   Ref PMADDWDOpImpl(IR::OpSize Size, Ref Src1, Ref Src2);
 
   Ref PMADDUBSWOpImpl(IR::OpSize Size, Ref Src1, Ref Src2);
+
+  Ref VPDPBUSDOpImpl(IR::OpSize Size, Ref Acc, Ref Src1, Ref Src2, bool Saturating);
+
+  Ref VPDPWSSDOpImpl(IR::OpSize Size, Ref Acc, Ref Src1, Ref Src2, bool Saturating);
 
   Ref PMULHRSWOpImpl(OpSize Size, Ref Src1, Ref Src2);
 
@@ -1480,7 +1599,7 @@ private:
   void SaveAVXState(Ref MemBase);
 
   void XRstorOpImpl(OpcodeArgs);
-  void RestoreX87State(Ref MemBase);
+  void RestoreX87State(OpcodeArgs, Ref MemBase);
   void RestoreSSEState(Ref MemBase);
   void RestoreMXCSRState(Ref MXCSR);
   void RestoreAVXState(Ref MemBase);
@@ -1501,6 +1620,20 @@ private:
   void StoreGPRRegister(uint32_t GPR, const Ref Src, IR::OpSize Size = OpSize::iInvalid, uint8_t Offset = 0);
   void StoreXMMRegister(uint32_t XMM, const Ref Src);
 
+  // Matches semantics around GPR storing that matches `StoreResult_WithOpSize` behaviour.
+  void StoreGPRResultWithZExtSemantics(uint32_t GPR, Ref Src, IR::OpSize OpSize) {
+    const auto GPRSize = GetGPROpSize();
+
+    if (GPRSize == OpSize::i64Bit && OpSize == OpSize::i32Bit) {
+      // If the Source IR op is 64 bits, we need to zext the upper bits
+      // For all other sizes, the upper bits are guaranteed to already be zero
+      Src = GetOpSize(Src) == OpSize::i64Bit ? ARef(Src).Bfe(0, 32).Ref() : Src;
+      StoreGPRRegister(GPR, Src, GPRSize);
+    } else {
+      StoreGPRRegister(GPR, Src, std::min(GPRSize, OpSize));
+    }
+  }
+
   Ref _GetRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset, bool Inline) {
     const auto GPRSize = GetGPROpSize();
     const auto Offs = Op->PC + Op->InstSize + Offset - Entry;
@@ -1511,18 +1644,24 @@ private:
     return _GetRelocatedPC(Op, Offset, false);
   }
 
-  void ExitRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset = 0) {
-    ExitFunction(_GetRelocatedPC(Op, Offset, true /* Inline */));
+  void ExitRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock) {
+    uint64_t PatchOffset = 0;
+    uint64_t PatchSize = 0;
+    if (Op->Src[0].IsLiteralPatchable() && Offset && Offset == (int64_t)Op->Src[0].Literal()) {
+      PatchOffset = Op->PC + Op->Src[0].Data.LiteralPatchable.FieldOffset;
+      PatchSize = Op->Src[0].Data.LiteralPatchable.Width;
+    }
+    ExitFunction(_GetRelocatedPC(Op, Offset, true /* Inline */), Hint, CallReturnAddress, CallReturnBlock, PatchOffset, PatchSize);
   }
 
-  void ExitRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock) {
-    ExitFunction(_GetRelocatedPC(Op, Offset, true /* Inline */), Hint, CallReturnAddress, CallReturnBlock);
+  void ExitRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset = 0) {
+    ExitRelocatedPC(Op, Offset, BranchHint::None, InvalidNode, InvalidNode);
   }
 
   [[nodiscard]]
   static bool IsOperandMem(const X86Tables::DecodedOperand& Operand, bool Load) {
     // Literals are immediates as sources but memory addresses as destinations.
-    return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation())) && !Operand.IsGPR();
+    return !(Load && (Operand.IsLiteral() || Operand.IsLiteralRelocation() || Operand.IsLiteralPatchable())) && !Operand.IsGPR();
   }
 
   [[nodiscard]]
@@ -1603,7 +1742,7 @@ private:
   }
 
   constexpr OpSize GetGuestVectorLength() const {
-    return (CTX->HostFeatures.SupportsSVE256 && CTX->HostFeatures.SupportsAVX) ? OpSize::i256Bit : OpSize::i128Bit;
+    return (CTX->HostFeatures.SupportsSVE256() && CTX->HostFeatures.SupportsAVX()) ? OpSize::i256Bit : OpSize::i128Bit;
   }
 
   [[nodiscard]]
@@ -1861,6 +2000,55 @@ private:
     InvalidateReg(Core::CPUState::AF_AS_GREG);
   }
 
+  // Sets the desired flags to zero when acid test is enabled.
+  // Not meant to be fast, just meant to produce consistent results.
+  void AcidTestFlags(unsigned BitOffset = 0, unsigned BitOffset2 = 0, unsigned BitOffset3 = 0, unsigned BitOffset4 = 0,
+                     unsigned BitOffset5 = 0, unsigned BitOffset6 = 0) {
+    if (!UndefinedFlagAcidTest) [[likely]] {
+      return;
+    }
+
+    unsigned BitFlags {};
+    if (BitOffset) {
+      BitFlags |= 1U << BitOffset;
+    }
+    if (BitOffset2) {
+      BitFlags |= 1U << BitOffset2;
+    }
+    if (BitOffset3) {
+      BitFlags |= 1U << BitOffset3;
+    }
+    if (BitOffset4) {
+      BitFlags |= 1U << BitOffset4;
+    }
+    if (BitOffset5) {
+      BitFlags |= 1U << BitOffset5;
+    }
+    if (BitOffset6) {
+      BitFlags |= 1U << BitOffset6;
+    }
+
+    auto Flag = Constant(0);
+    if (BitFlags & (1U << X86State::RFLAG_SF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_SF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_ZF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_ZF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_CF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_CF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_OF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_OF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_AF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_AF_RAW_LOC);
+    }
+    if (BitFlags & (1U << X86State::RFLAG_AF_RAW_LOC)) {
+      SetRFLAG(Flag, FEXCore::X86State::RFLAG_AF_RAW_LOC);
+    }
+  }
+
   [[nodiscard]]
   static CondClass CondForNZCVBit(unsigned BitOffset, bool Invert) {
     switch (BitOffset) {
@@ -1926,12 +2114,25 @@ private:
     uint64_t Partial;
 
     Ref Value[64];
+
+    // Keep track of where each register was last written to within the current block,
+    // for use in peephole optimizations. LastDefIndex is a parallel structure,
+    // which tracks the index of each Op in LastDef.
+    Ref LastDef[64];
+    uint32_t LastDefIndex[64];
+    // Similar to LastDef, but tracks the write before LastDef. Think of it as LastDef^2.
+    Ref PrevDef[64];
+    uint32_t PrevDefIndex[64];
+
+    // The index of the current instruction in the current block.
+    uint32_t Index;
   } RegCache {};
 
   void InvalidateReg(uint8_t Index) {
     uint64_t Bit = (1ull << (uint64_t)Index);
     RegCache.Cached &= ~Bit;
     RegCache.Written &= ~Bit;
+    RegCache.LastDef[Index] = nullptr;
   }
 
   Ref LoadRegCache(uint64_t Offset, uint8_t Index, RegClass Class, IR::OpSize Size) {
@@ -2047,6 +2248,10 @@ private:
     RegCache.Value[Index] = Value;
     RegCache.Cached |= Bit;
     RegCache.Written |= Bit;
+    RegCache.PrevDef[Index] = RegCache.LastDef[Index];
+    RegCache.PrevDefIndex[Index] = RegCache.LastDefIndex[Index];
+    RegCache.LastDef[Index] = Value;
+    RegCache.LastDefIndex[Index] = RegCache.Index;
   }
 
   void InvalidateHighAVXRegisters() {
@@ -2134,16 +2339,16 @@ private:
   }
 
   // Compares two floats and sets flags for a COMISS instruction
-  void Comiss(IR::OpSize ElementSize, Ref Src1, Ref Src2, bool InvalidateAF = false) {
+  void Comiss(IR::OpSize ElementSize, Ref Src1, Ref Src2) {
     // First, set flags according to Arm FCMP.
     HandleNZCVWrite();
     _FCmp(ElementSize, Src1, Src2);
     CFInverted = false;
-    ComissFlags(InvalidateAF);
+    ComissFlags();
   }
 
   // Sets flags for a COMISS instruction
-  void ComissFlags(bool InvalidateAF = false) {
+  void ComissFlags() {
     LOGMAN_THROW_A_FMT(!NZCVDirty, "only expected after fcmp");
 
     // We need to set PF according to the unordered flag. We'd rather do this
@@ -2158,12 +2363,14 @@ private:
     Ref V_inv = GetRFLAG(FEXCore::X86State::RFLAG_OF_RAW_LOC, true);
     SetRFLAG<FEXCore::X86State::RFLAG_PF_RAW_LOC>(V_inv);
 
-    if (!InvalidateAF) {
-      // Zero AF. Note that the comparison sets the raw PF to 0/1 above, so
-      // PF[4] is 0 so the XOR with PF will have no effect, so setting the AF
-      // byte to zero will indeed zero AF as intended.
-      SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Constant(0));
-    }
+    // Both Intel and AMD manual state that OF, SF, and AF are set to zero.
+    //
+    // Zero AF. Note that the comparison sets the raw PF to 0/1 above, so
+    // PF[4] is 0 so the XOR with PF will have no effect, so setting the AF
+    // byte to zero will indeed zero AF as intended.
+    // OF and SF are zeroed:
+    // _AXFLAG always produces N=0 (SF), V=0 (OF)
+    SetRFLAG<FEXCore::X86State::RFLAG_AF_RAW_LOC>(Constant(0));
 
     // Convert NZCV from the Arm representation to an eXternal representation
     // that's totally not a euphemism for x86, nuh-uh. But maps to exactly we
@@ -2375,7 +2582,7 @@ private:
   void CalculateFlags_MUL(IR::OpSize SrcSize, Ref Res, Ref High);
   void CalculateFlags_UMUL(Ref High);
   void CalculateFlags_Logical(IR::OpSize SrcSize, Ref Res);
-  void CalculateFlags_ShiftLeftImmediate(IR::OpSize SrcSize, Ref Res, Ref Src1, uint64_t Shift);
+  void CalculateFlags_ShiftLeftImmediate(IR::OpSize SrcSize, Ref Res, Ref Src1, uint64_t Shift, bool DoubleWide = false);
   void CalculateFlags_ShiftRightImmediate(IR::OpSize SrcSize, Ref Res, Ref Src1, uint64_t Shift);
   void CalculateFlags_ShiftRightDoubleImmediate(IR::OpSize SrcSize, Ref Res, Ref Src1, uint64_t Shift);
   void CalculateFlags_ShiftRightImmediateCommon(IR::OpSize SrcSize, Ref Res, Ref Src1, uint64_t Shift);
@@ -2387,6 +2594,12 @@ private:
   void SetX87FTW(Ref FTW);
   Ref GetX87FTW_Helper();
   void SetX87Top(Ref Value);
+  void StoreX87FIP(FEXCore::X86Tables::DecodedOp Op) {
+    if (CTX->Config.JITFeatures & FEXCore::Config::JITFeatures::ENABLEX87FIP) {
+      // Only store FIP if the feature is enabled.
+      _StoreContextGPR(OpSize::i64Bit, GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, FIP));
+    }
+  }
 
   void ChgStateX87_MMX() override {
     LOGMAN_THROW_A_FMT(MMXState == MMXState_X87, "Expected state to be x87");

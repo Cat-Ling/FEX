@@ -51,6 +51,14 @@
 #define PR_SHADOW_STACK_ENABLE (1ULL << 0)
 #endif
 
+#ifndef PR_GET_MDWE
+#define PR_GET_MDWE 66
+#endif
+
+#ifndef PR_GET_TPIDRRO_CPU
+#define PR_GET_TPIDRRO_CPU 0x7F1DBB0
+#endif
+
 #elif defined(__APPLE__)
 #include <sys/mman.h>
 // Stub prctl constants for Apple

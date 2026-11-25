@@ -1,5 +1,5 @@
 list(APPEND LIBS FEXCore Common JemallocLibs LinuxEmulation
-  CommonTools ${PTHREAD_LIB} fmt::fmt)
+  CommonTools Threads::Threads fmt::fmt)
 
 set(DEFINES)
 if (ENABLE_VIXL_SIMULATOR)
@@ -30,12 +30,6 @@ LinkerGC(FEX)
 install(TARGETS FEX RUNTIME
     DESTINATION bin
     COMPONENT Runtime)
-
-# Create a copy of FEX with legacy names until phased out.
-install(PROGRAMS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/FEX
-  RENAME FEXInterpreter
-  DESTINATION bin
-  COMPONENT LegacyRuntime)
 
 if (ARCHITECTURE_arm64)
   if (NOT USE_LEGACY_BINFMTMISC)

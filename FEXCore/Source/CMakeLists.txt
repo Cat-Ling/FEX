@@ -4,6 +4,7 @@ set(FEXCORE_BASE_SRCS
   Interface/Config/Config.cpp
   Utils/Allocator.cpp
   Utils/FileLoading.cpp
+  Utils/FileUtils.cpp
   Utils/ForcedAssert.cpp
   Utils/LogManager.cpp
   Utils/SpinWaitLock.cpp
@@ -18,12 +19,14 @@ set(SRCS
   Common/JitSymbols.cpp
   Interface/Context/Context.cpp
   Interface/Core/LookupCache.cpp
+  Interface/Core/DiskCache.cpp
   Interface/Core/CodeCache.cpp
   Interface/Core/Core.cpp
   Interface/Core/CPUBackend.cpp
   Interface/Core/Addressing.cpp
   Interface/Core/CPUID.cpp
   Interface/Core/Frontend.cpp
+  Interface/Core/SharedCodeBufferManager.cpp
   Interface/Core/OpcodeDispatcher/AVX_128.cpp
   Interface/Core/OpcodeDispatcher/Crypto.cpp
   Interface/Core/OpcodeDispatcher/Flags.cpp
@@ -69,6 +72,7 @@ set(SRCS
   Utils/LongJump.cpp
   Utils/Telemetry.cpp
   Utils/Threads.cpp
+  Utils/WorkQueueThread.cpp
   Utils/Profiler.cpp)
 
 if (ARCHITECTURE_arm64)
@@ -101,9 +105,13 @@ if (ENABLE_ZYDIS)
 endif()
 
 if (ARCHITECTURE_arm64 AND HAS_CLANG_PRESERVE_ALL)
-  list(APPEND DEFINES "-DFEXCORE_PRESERVE_ALL_ATTR=__attribute__((preserve_all));-DFEXCORE_HAS_PRESERVE_ALL_ATTR=1")
+  list(APPEND DEFINES
+    "-DFEXCORE_PRESERVE_ALL_ATTR=__attribute__((preserve_all))"
+    "-DFEXCORE_HAS_PRESERVE_ALL_ATTR=1")
 else()
-  list(APPEND DEFINES "-DFEXCORE_PRESERVE_ALL_ATTR=;-DFEXCORE_HAS_PRESERVE_ALL_ATTR=0")
+  list(APPEND DEFINES
+    "-DFEXCORE_PRESERVE_ALL_ATTR="
+    "-DFEXCORE_HAS_PRESERVE_ALL_ATTR=0")
 endif()
 
 set(LIBS fmt::fmt xxHash::xxhash FEXHeaderUtils CodeEmitter cephes_128bit)
@@ -186,8 +194,8 @@ add_custom_command(
   OUTPUT "${OUTPUT_MAN_NAME}"
   DEPENDS "${INPUT_CONFIG_NAME}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../Scripts/config_generator.py"
-  COMMAND "python3" "${CMAKE_CURRENT_SOURCE_DIR}/../Scripts/config_generator.py" "${INPUT_CONFIG_NAME}" "${OUTPUT_CONFIG_NAME}" "${OUTPUT_MAN_NAME}"
-  "${OUTPUT_CONFIG_OPTION_NAME}" ${FEX_GENERATOR_FEATURES})
+  COMMAND "python3" "${CMAKE_CURRENT_SOURCE_DIR}/../Scripts/config_generator.py"
+    "${INPUT_CONFIG_NAME}" "${OUTPUT_CONFIG_NAME}" "${OUTPUT_MAN_NAME}" "${OUTPUT_CONFIG_OPTION_NAME}" ${FEX_GENERATOR_FEATURES})
 
 add_custom_command(
   OUTPUT "${OUTPUT_MAN_NAME_COMPRESS}"
@@ -261,6 +269,10 @@ endfunction()
 # Build FEXCore_Base static library
 add_library(FEXCore_Base STATIC ${FEXCORE_BASE_SRCS})
 target_link_libraries(FEXCore_Base PUBLIC ${LIBS})
+if (MINGW)
+  target_link_libraries(FEXCore_Base PUBLIC ntdll)
+endif()
+
 AddDefaultOptionsToTarget(FEXCore_Base)
 
 if (ENABLE_FEXCORE_PROFILER AND FEXCORE_PROFILER_BACKEND STREQUAL "TRACY")
@@ -279,8 +291,8 @@ function(AddLibrary Name Type)
   add_library(${Name} ${Type} $<TARGET_OBJECTS:${PROJECT_NAME}_object>)
   set_target_properties(${Name} PROPERTIES OUTPUT_NAME FEXCore)
 
-  # During generation of the import library (dll.a), MinGW needs some extra symbols from libraries
-  # such as fmt, which are propagated by FEXCore_Base. Wonderful.
+  # During generation of the import library (dll.a), MinGW needs some extra
+  # symbols from libraries such as fmt, which are propagated by FEXCore_Base
   if (MINGW)
     target_link_libraries(${Name} PRIVATE FEXCore_Base)
   endif()
@@ -303,9 +315,11 @@ add_library(JemallocLibs STATIC Utils/AllocatorHooks.cpp)
 if (ENABLE_FEX_ALLOCATOR)
   target_compile_definitions(JemallocLibs PRIVATE ENABLE_FEX_ALLOCATOR=1)
   target_link_libraries(JemallocLibs PUBLIC rpmalloc)
+  target_include_directories(JemallocLibs PRIVATE "${PROJECT_SOURCE_DIR}/include/")
 endif()
 if (ENABLE_JEMALLOC_GLIBC_ALLOC)
-  set_source_files_properties(Interface/HLE/Thunks/Thunks.cpp PROPERTIES COMPILE_DEFINITIONS ENABLE_JEMALLOC_GLIBC=1)
+  set_source_files_properties(Interface/HLE/Thunks/Thunks.cpp
+    PROPERTIES COMPILE_DEFINITIONS ENABLE_JEMALLOC_GLIBC=1)
   target_link_libraries(JemallocLibs INTERFACE FEX_jemalloc_glibc)
 endif()
 

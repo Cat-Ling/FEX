@@ -19,6 +19,7 @@ inline NTSTATUS Call(FEXUnixLibFunctions code, void* args) {
 }
 
 bool Init(HMODULE NtDll);
+bool Available();
 
 /**
  * @brief Tries to enable hardware TSO if supported.
@@ -45,4 +46,14 @@ struct SHMSlotResult {
 };
 SHMSlotResult AllocateSHMSlots(void* SHMBase, uint32_t MapSize, uint32_t MaxSize);
 void DeleteSHMStatsFile();
+
+void* MapFile(HANDLE FileHandle, uint64_t MapSize);
+
+// Returns the process pid when unixlib is available.
+// Or returns the process ID otherwise.
+uint32_t GetPID();
+
+// Returns true if the system supports CPU Index in TPIDRRO
+bool SupportsTPIDRRO_CPU();
+
 } // namespace FEX::Windows::UnixLib

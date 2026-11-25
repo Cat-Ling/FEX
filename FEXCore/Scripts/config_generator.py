@@ -337,7 +337,7 @@ def print_parse_envloader_options(options):
             value_type = op_vals["Type"]
             if (value_type == "strenum"):
                 output_argloader.write("else if (Key == \"FEX_{0}\") {{\n".format(op_key.upper()))
-                output_argloader.write("\tValue = FEXCore::Config::EnumParser<FEXCore::Config::{}ConfigPair>(FEXCore::Config::{}_EnumPairs, Value_View);\n".format(op_key, op_key))
+                output_argloader.write("\tValue = FEXCore::Config::EnumParser(FEXCore::Config::{}_EnumPairs, Value_View);\n".format(op_key))
                 output_argloader.write("}\n")
 
             if ("ArgumentHandler" in op_vals):
@@ -357,7 +357,7 @@ def print_parse_jsonloader_options(options):
             value_type = op_vals["Type"]
             if (value_type == "strenum"):
                 output_argloader.write("else if (KeyName == \"{0}\") {{\n".format(op_key))
-                output_argloader.write("\tSet(KeyOption, FEXCore::Config::EnumParser<FEXCore::Config::{}ConfigPair>(FEXCore::Config::{}_EnumPairs, Value_View));\n".format(op_key, op_key))
+                output_argloader.write("\tSet(KeyOption, FEXCore::Config::EnumParser(FEXCore::Config::{}_EnumPairs, Value_View));\n".format(op_key))
                 output_argloader.write("}\n")
             elif (value_type == "strarray"):
                 output_argloader.write("else if (KeyName == \"{0}\") {{\n".format(op_key))
@@ -394,13 +394,12 @@ def print_parse_enum_options(options):
             if (op_vals["Type"] == "strenum"):
                 Enums = op_vals["Enums"]
 
-                output_argloader.write("using {}ConfigPair = std::pair<std::string_view, FEXCore::Config::{}>;\n".format(op_key, op_key))
-                output_argloader.write("constexpr static std::array<{}ConfigPair, {}> {}_EnumPairs = {{{{\n".format(op_key, len(Enums) + 1, op_key))
+                output_argloader.write("constexpr static std::array<StringEnumPairType, {}> {}_EnumPairs = {{{{\n".format(len(Enums) + 1, op_key))
                 i = 0
                 # Always have an OFF.
-                output_argloader.write("\t{{ \"off\", FEXCore::Config::{}::OFF }},\n".format(op_key))
+                output_argloader.write("\t{{ \"off\", FEXCore::ToUnderlying(FEXCore::Config::{}::OFF) }},\n".format(op_key))
                 for enum_op_key, enum_op_vals in Enums.items():
-                    output_argloader.write("\t{{ \"{}\", FEXCore::Config::{}::{} }},\n".format(enum_op_vals, op_key, enum_op_key.upper()))
+                    output_argloader.write("\t{{ \"{}\", FEXCore::ToUnderlying(FEXCore::Config::{}::{}) }},\n".format(enum_op_vals, op_key, enum_op_key.upper()))
                     i += 1
 
                 output_argloader.write("}};\n")
@@ -412,6 +411,32 @@ def print_parse_enum_options(options):
 # option were not in the JSON at all.
 EnabledFeatures = set(Arg.split("=", 1)[1] for Arg in sys.argv[1:] if Arg.startswith("--feature="))
 sys.argv = [Arg for Arg in sys.argv if not Arg.startswith("--feature=")]
+
+def print_affects_codegen_options(options, unnamed_options):
+    output_argloader.write("#ifdef CONFIG_AFFECTSCODEGEN\n")
+    output_argloader.write("#undef CONFIG_AFFECTSCODEGEN\n")
+
+    TotalConfigOptions = 0
+    for op_group, group_vals in options.items():
+        for op_key, op_vals in group_vals.items():
+            TotalConfigOptions += 1
+    for op_group, group_vals in unnamed_options.items():
+        for op_key, op_vals in group_vals.items():
+            TotalConfigOptions += 1
+
+    output_argloader.write("constexpr static std::array<bool, {}> Config_AffectsCodeGen = {{{{\n".format(TotalConfigOptions))
+    for op_group, group_vals in options.items():
+        for op_key, op_vals in group_vals.items():
+            assert "AffectsCodeGen" in op_vals, "All config options must be marked if they affect codegen."
+            output_argloader.write("\t{}, // {}\n".format(op_vals["AffectsCodeGen"], op_key))
+
+    for op_group, group_vals in unnamed_options.items():
+        for op_key, op_vals in group_vals.items():
+            assert "AffectsCodeGen" in op_vals, "All config options must be marked if they affect codegen."
+            output_argloader.write("\t{}, // {}\n".format(op_vals["AffectsCodeGen"], op_key))
+    output_argloader.write("}};\n")
+
+    output_argloader.write("#endif\n")
 
 if (len(sys.argv) < 5):
     sys.exit()
@@ -459,5 +484,7 @@ print_parse_jsonloader_options(options);
 
 # Generate enum variable options
 print_parse_enum_options(options);
+
+print_affects_codegen_options(options, unnamed_options);
 
 output_argloader.close()

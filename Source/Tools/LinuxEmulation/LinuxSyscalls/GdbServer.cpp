@@ -9,6 +9,7 @@ $end_info$
 #include "CodeLoader.h"
 #include "GdbServer/Info.h"
 
+#include <charconv>
 #include <cstdlib>
 #include <cstdio>
 #include <iomanip>
@@ -1441,9 +1442,11 @@ void GdbServer::GdbServerLoop() {
   Acceptor->async_accept([this](fasio::error ec, std::optional<fasio::tcp_socket> Socket) {
     if (ec != fasio::error::success) {
       // Listen socket error or shutting down
-      LogMan::Msg::EFmt("[GdbServer] gdbserver shutting down: {}");
-      close(CommsSocket->FD);
-      CommsSocket.reset();
+      if (CommsSocket) {
+        LogMan::Msg::EFmt("[GdbServer] gdbserver shutting down: {}", CommsSocket->FD);
+        close(CommsSocket->FD);
+        CommsSocket.reset();
+      }
       // Repeat to wait for another connection
       return fasio::post_callback::repeat;
     }
@@ -1480,9 +1483,7 @@ static void* ThreadHandler(void* Arg) {
 }
 
 void GdbServer::StartThread() {
-  uint64_t OldMask = HLE::ThreadManager::SetSignalMask(~0ULL);
-  gdbServerThread = FEXCore::Threads::Thread::Create(ThreadHandler, this);
-  HLE::ThreadManager::SetSignalMask(OldMask);
+  gdbServerThread = FEXCore::Threads::Thread::Create(ThreadHandler, this, {.Internal = true});
 }
 
 void GdbServer::OpenListenSocket() {

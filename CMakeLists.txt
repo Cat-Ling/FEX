@@ -5,40 +5,69 @@ include(CheckIncludeFiles)
 check_include_files("gdb/jit-reader.h" HAVE_GDB_JIT_READER_H)
 
 option(BUILD_FEX_LINUX_TESTS "Build FEXLinuxTests (requires x86 compiler)" FALSE)
+option(BUILD_FEX_MINGW_TESTS "Build FEXMingwTests (requires llvm-mingw compiler)" FALSE)
 option(BUILD_THUNKS "Build thunks" FALSE)
-option(BUILD_FEXCONFIG "Build FEXConfig" TRUE)
 option(ENABLE_CLANG_THUNKS "Build thunks with clang" TRUE)
+
+option(BUILD_FEXCONFIG "Build FEXConfig" TRUE)
 option(ENABLE_IWYU "Enable the Include What You Use sanitizer" FALSE)
 option(ENABLE_LTO "Enable LTO with compilation" TRUE)
-option(ENABLE_XRAY "Enable building with LLVM X-Ray" FALSE)
+option(ENABLE_COVERAGE "Enable Code Coverage" FALSE)
 set(USE_LINKER "" CACHE STRING "Path to a custom linker program")
+
+option(ENABLE_XRAY "Enable building with LLVM X-Ray" FALSE)
 option(ENABLE_UBSAN "Enable the Clang Undefined Behavior Sanitizer" FALSE)
 option(ENABLE_ASAN "Enable the Clang Address Sanitizer" FALSE)
 option(ENABLE_TSAN "Enable the Clang Thread Sanitizer" FALSE)
-option(ENABLE_COVERAGE "Enable Code Coverage" FALSE)
+
 option(ENABLE_ASSERTIONS "Enable debug assertions" FALSE)
 option(ENABLE_GDB_SYMBOLS "Enable GDBSymbols integration support" ${HAVE_GDB_JIT_READER_H})
+
 option(ENABLE_STRICT_WERROR "Enable stricter -Werror" FALSE)
 option(ENABLE_WERROR "Enable -Werror" FALSE)
+
 option(ENABLE_FEX_ALLOCATOR "Enable allocator for FEX" TRUE)
 option(ENABLE_JEMALLOC_GLIBC_ALLOC "Enable jemalloc glibc allocator" TRUE)
+
 option(ENABLE_OFFLINE_TELEMETRY "Enable FEX offline telemetry" TRUE)
 option(ENABLE_COMPILE_TIME_TRACE "Enable time trace compile option" FALSE)
+
 option(ENABLE_LIBCXX "Use LLVM's libc++ instead of the GNU libstdc++" FALSE)
 option(ENABLE_CCACHE "Enable ccache for build caching" TRUE)
+
 option(ENABLE_VIXL_SIMULATOR "Use the VIXL simulator for emulation (only useful for CI testing)" FALSE)
 option(ENABLE_VIXL_DISASSEMBLER "Enable debug disassembler output with VIXL" FALSE)
 option(ENABLE_ZYDIS "Enable x86/x86-64 guest disassembler output with Zydis" FALSE)
+
 option(USE_LEGACY_BINFMTMISC "Use legacy method of setting up binfmt_misc" FALSE)
+
 option(ENABLE_FEXCORE_PROFILER "Enable FEXCore's timeline profiling capabilities" FALSE)
 set(FEXCORE_PROFILER_BACKEND "gpuvis" CACHE STRING "Set which backend to use for FEXCore's profiler")
 set_property(CACHE FEXCORE_PROFILER_BACKEND PROPERTY STRINGS gpuvis tracy)
+
 option(ENABLE_GLIBC_ALLOCATOR_HOOK_FAULT "Enables glibc memory allocation hooking with fault for CI testing")
+
 option(USE_PDB_DEBUGINFO "Build debug info in PDB format" FALSE)
 option(BUILD_STEAM_SUPPORT "Enable Steam integration" FALSE)
 
-set(X86_32_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_32.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting i686")
-set(X86_64_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_64.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting x86_64")
+set(X86_32_TOOLCHAIN_FILE
+  "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_32.cmake"
+  CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting i686")
+
+set(X86_64_TOOLCHAIN_FILE
+  "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_64.cmake"
+  CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting x86_64")
+
+if (BUILD_FEX_MINGW_TESTS)
+  set(LLVM_MINGW "" CACHE FILEPATH "Path to llvm_mingw")
+  set(X86_32_MINGW_TOOLCHAIN_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_mingw_x86_32.cmake"
+    CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting mingw_i686")
+  set(X86_64_MINGW_TOOLCHAIN_FILE
+    "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_mingw_x86_64.cmake"
+    CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting mingw_x86_64")
+endif()
+
 set(X86_DEV_ROOTFS "/" CACHE FILEPATH "Path to the sysroot used for cross-compiling for i686 and x86_64")
 set(DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
 set(HOSTLIBS_DATA_DIRECTORY "" CACHE PATH "Global data directory (override)")
@@ -81,7 +110,8 @@ else ()
   message(STATUS "Clang version ${CMAKE_CXX_COMPILER_VERSION}")
   set(CLANG_MINIMUM_VERSION 13.0)
   if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS ${CLANG_MINIMUM_VERSION})
-    message(FATAL_ERROR "Clang version too old for FEX. Need at least ${CLANG_MINIMUM_VERSION} but has ${CMAKE_CXX_COMPILER_VERSION}")
+    message(FATAL_ERROR "Clang version too old for FEX. Need at least "
+      "${CLANG_MINIMUM_VERSION} but has ${CMAKE_CXX_COMPILER_VERSION}")
   endif()
 endif()
 
@@ -156,7 +186,8 @@ if (ENABLE_FEXCORE_PROFILER)
     # Tracy can gather call stack samples in regular intervals, but this
     # isn't useful for us since it would usually sample opaque JIT code
     add_compile_definitions(TRACY_NO_SAMPLING=1)
-    # This pulls in libbacktrace which allocators in global constructors (before FEX can set up its allocator hooks)
+    # This pulls in libbacktrace which allocators in global constructors
+    # (before FEX can set up its allocator hooks)
     add_compile_definitions(TRACY_NO_CALLSTACK=1)
     if (MINGW)
       message(FATAL_ERROR "Tracy profiler not supported on MinGW")
@@ -193,8 +224,7 @@ set(OVERRIDE_HASH "detect" CACHE STRING "Override the FEX git hash")
 
 get_property(IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if (NOT IS_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release
-        CACHE STRING "Choose the type of build." FORCE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
     message(STATUS "No build type set, defaulting to a Release build")
 endif()
 
@@ -214,6 +244,9 @@ if (ENABLE_GDB_SYMBOLS)
 endif()
 
 add_compile_definitions(_LARGEFILE64_SOURCE)
+if (WIN32)
+  add_compile_definitions(UNICODE _UNICODE)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -240,11 +273,17 @@ check_cxx_source_compiles(
   HAS_CLANG_PRESERVE_ALL)
 unset(CMAKE_REQUIRED_FLAGS)
 if (HAS_CLANG_PRESERVE_ALL)
-  if (MINGW)
+  message(STATUS "Clang version ${CMAKE_CXX_COMPILER_VERSION}")
+  set(CLANG_MINIMUM_VERSION 22.1)
+  if (MINGW AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS ${CLANG_MINIMUM_VERSION})
     message(STATUS "Ignoring broken clang::preserve_all support")
     set(HAS_CLANG_PRESERVE_ALL FALSE)
   else()
     message(STATUS "Has clang::preserve_all")
+    if (MINGW)
+      message(STATUS "Disabling asynchronous-unwind-tables due to bug with preserve_all and mingw")
+      add_compile_options(-fno-asynchronous-unwind-tables)
+    endif()
   endif()
 endif()
 
@@ -262,7 +301,7 @@ check_cxx_source_compiles(
   return program_invocation_name == nullptr;
   }"
   HAS_PROGRAM_INVOCATION_NAME)
-add_compile_definitions("HAS_PROGRAM_INVOCATION_NAME=${HAS_PROGRAM_INVOCATION_NAME}")
+add_compile_definitions( "HAS_PROGRAM_INVOCATION_NAME=${HAS_PROGRAM_INVOCATION_NAME}")
 
 if (ENABLE_VIXL_SIMULATOR)
   # We can run the simulator on both x86-64 or AArch64 hosts
@@ -294,11 +333,8 @@ if (ENABLE_COMPILE_TIME_TRACE)
   link_libraries(-ftime-trace)
 endif()
 
-if (APPLE)
-  set(PTHREAD_LIB "")
-else()
-  set(PTHREAD_LIB pthread)
-endif()
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 if (USE_LINKER)
   message(STATUS "Overriding linker to: ${USE_LINKER}")
@@ -307,8 +343,8 @@ endif()
 
 if (ENABLE_LIBCXX)
   message(WARNING "This is an unsupported configuration and should only be used for testing")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -stdlib=libc++")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libc++ -lc++abi")
+  string(APPEND CMAKE_CXX_FLAGS " -std=c++11 -stdlib=libc++")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " -stdlib=libc++ -lc++abi")
 endif()
 
 if (NOT ENABLE_OFFLINE_TELEMETRY)
@@ -318,15 +354,16 @@ endif()
 
 if (ENABLE_UBSAN)
   # See https://github.com/FEX-Emu/FEX/pull/4494#issuecomment-2800608944
-  # and related discussion for the use of -fno-sanitize=alignment -fno-sanitize=function
-  # with UBSAN.
-  # alignment: we don't follow a strict alignment policy, for example IR uses packed structs
-  # that are regularly access unaligned.
-  # function: syscalls cast function pointers to void (*)(unsigned long...), causing warnings
-  # related to this access.
+  # and related discussion for the use of -fno-sanitize=alignment and -fno-sanitize=function with UBSAN.
+  # alignment: we don't follow a strict alignment policy, for example IR uses packed structs that are regularly access unaligned.
+  # function: syscalls cast function pointers to void (*)(unsigned long...), causing warnings related to this access.
   add_compile_definitions(ENABLE_UBSAN=1)
-  add_compile_options(-fno-omit-frame-pointer -fsanitize=undefined -fno-sanitize=alignment -fno-sanitize=function -fno-sanitize-recover=undefined)
-  link_libraries(-fno-omit-frame-pointer -fsanitize=undefined -fno-sanitize=alignment -fno-sanitize=function -fno-sanitize-recover=undefined)
+  add_compile_options(-fno-omit-frame-pointer -fsanitize=undefined
+    -fno-sanitize=alignment -fno-sanitize=function
+    -fno-sanitize-recover=undefined)
+  link_libraries(-fno-omit-frame-pointer -fsanitize=undefined
+    -fno-sanitize=alignment -fno-sanitize=function
+    -fno-sanitize-recover=undefined)
 endif()
 
 if (ENABLE_ASAN)
@@ -353,7 +390,8 @@ if (APPLE)
 elseif (ENABLE_JEMALLOC_GLIBC_ALLOC)
   # The glibc jemalloc subproject which hooks the glibc allocator.
   # Required for thunks to work.
-  # All host native libraries will use this allocator, while *most* other FEX internal allocations will use the other jemalloc allocator.
+  # All host native libraries will use this allocator, while *most*
+  # other FEX internal allocations will use the other jemalloc allocator.
   add_subdirectory(External/jemalloc_glibc/)
 elseif (NOT MINGW)
   message(STATUS
@@ -379,11 +417,11 @@ if (USE_PDB_DEBUGINFO)
   add_link_options(-g -Wl,--pdb=)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fno-omit-frame-pointer")
-set(CMAKE_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_LINKER_FLAGS_RELWITHDEBINFO} -fno-omit-frame-pointer")
+string(APPEND CMAKE_CXX_FLAGS_RELWITHDEBINFO " -fno-omit-frame-pointer")
+string(APPEND CMAKE_LINKER_FLAGS_RELWITHDEBINFO " -fno-omit-frame-pointer")
 
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fomit-frame-pointer")
-set(CMAKE_LINKER_FLAGS_RELEASE "${CMAKE_LINKER_FLAGS_RELEASE} -fomit-frame-pointer")
+string(APPEND CMAKE_CXX_FLAGS_RELEASE " -fomit-frame-pointer")
+string(APPEND CMAKE_LINKER_FLAGS_RELEASE " -fomit-frame-pointer")
 
 ## Modules ##
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/Data/CMake/)
@@ -392,7 +430,10 @@ include(LinkerGC)
 
 ## Externals ##
 
-find_package(unordered_dense QUIET CONFIG)
+if (NOT BUILD_STEAM_SUPPORT)
+  find_package(unordered_dense QUIET CONFIG)
+endif()
+
 if (NOT unordered_dense_FOUND)
   add_subdirectory(External/unordered_dense)
 endif()
@@ -403,8 +444,10 @@ if (BUILD_TESTING OR ENABLE_VIXL_DISASSEMBLER OR ENABLE_VIXL_SIMULATOR)
 endif()
 
 if (ENABLE_ZYDIS)
-  find_package(Zycore 1.5 MODULE QUIET)
-  find_package(Zydis 4.0 MODULE QUIET)
+  if (NOT BUILD_STEAM_SUPPORT)
+    find_package(Zycore 1.5 MODULE QUIET)
+    find_package(Zydis 4.0 MODULE QUIET)
+  endif()
 
   if (TARGET Zydis::Zydis AND TARGET Zycore::Zycore)
     message(STATUS "Using system Zydis")
@@ -425,7 +468,7 @@ find_package(Python 3.9 REQUIRED COMPONENTS Interpreter)
 
 set(BUILD_SHARED_LIBS OFF)
 
-if (NOT CMAKE_CROSSCOMPILING)
+if (NOT CMAKE_CROSSCOMPILING AND NOT BUILD_STEAM_SUPPORT)
   find_package(xxhash MODULE QUIET)
 endif()
 
@@ -444,7 +487,8 @@ if (BUILD_TESTING)
     add_subdirectory(External/Catch2/)
 
     # Pull in catch_discover_tests definition
-    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/External/Catch2/contrib/")
+    list(APPEND CMAKE_MODULE_PATH
+      "${CMAKE_CURRENT_SOURCE_DIR}/External/Catch2/contrib/")
   endif()
 
   include(Catch)
@@ -453,17 +497,26 @@ else ()
   file(GENERATE OUTPUT CTestTestfile.cmake CONTENT "# No tests since BUILD_TESTING is disabled")
 endif()
 
-find_package(fmt QUIET)
-if (NOT fmt_FOUND)
-  # Disable fmt install
+if (MINGW OR BUILD_STEAM_SUPPORT)
   set(FMT_INSTALL OFF)
   add_subdirectory(External/fmt/)
+else()
+  find_package(fmt QUIET)
+  if (NOT fmt_FOUND)
+    # Disable fmt install
+    set(FMT_INSTALL OFF)
+    add_subdirectory(External/fmt/)
+  endif()
 endif()
 
-find_package(range-v3 QUIET)
+if (NOT BUILD_STEAM_SUPPORT)
+  find_package(range-v3 QUIET)
+endif()
+
 if (NOT range-v3_FOUND)
   add_subdirectory(External/range-v3/)
-  target_compile_definitions(range-v3 INTERFACE RANGES_DISABLE_DEPRECATED_WARNINGS)
+  target_compile_definitions(range-v3 INTERFACE
+    RANGES_DISABLE_DEPRECATED_WARNINGS)
 endif()
 
 add_subdirectory(External/tiny-json/)
@@ -504,54 +557,82 @@ if(ENABLE_WERROR OR ENABLE_STRICT_WERROR)
 endif()
 
 set(FEX_TUNE_COMPILE_FLAGS)
-if (NOT TUNE_ARCH STREQUAL "generic")
-  check_cxx_compiler_flag("-march=${TUNE_ARCH}" COMPILER_SUPPORTS_ARCH_TYPE)
-  if(COMPILER_SUPPORTS_ARCH_TYPE)
-    list(APPEND FEX_TUNE_COMPILE_FLAGS "-march=${TUNE_ARCH}")
-  else()
-    message(FATAL_ERROR "Trying to compile arch type '${TUNE_ARCH}' but the compiler doesn't support this")
+
+# Check if -march/mcpu was already defined in the passed in flags.
+# Assume someone knows better than us in this case.
+string(FIND "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS}" "-march" MARCH_POS)
+string(FIND "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS}" "-mcpu" MCPU_POS)
+if (MCPU_POS EQUAL -1)
+  # Try mtune as well just in-case.
+  string(FIND "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS}" "-mtune" MCPU_POS)
+endif()
+
+if (MARCH_POS EQUAL -1)
+  if (NOT TUNE_ARCH STREQUAL "generic")
+    set(TUNE_ARCH_STRING "${TUNE_ARCH}")
+    if(ARCHITECTURE_arm64)
+      set(TUNE_ARCH_STRING "${TUNE_ARCH}+crc")
+    endif()
+
+    check_cxx_compiler_flag("-march=${TUNE_ARCH_STRING}" COMPILER_SUPPORTS_ARCH_TYPE)
+    if(COMPILER_SUPPORTS_ARCH_TYPE)
+      list(APPEND FEX_TUNE_COMPILE_FLAGS "-march=${TUNE_ARCH_STRING}")
+    else()
+      message(FATAL_ERROR "Trying to compile arch type '${TUNE_ARCH_STRING}' but the compiler doesn't support this")
+    endif()
+  elseif(ARCHITECTURE_arm64)
+    # Need to always append crc
+    check_cxx_compiler_flag("-march=armv8-a+crc" COMPILER_SUPPORTS_ARCH_TYPE)
+    list(APPEND FEX_TUNE_COMPILE_FLAGS "-march=armv8-a+crc")
   endif()
 endif()
 
-if (TUNE_CPU STREQUAL "native")
-  if(ARCHITECTURE_arm64)
-    if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 999999.0)
-      # Clang 12.0 fixed the -mcpu=native bug with mixed big.little implementers
-      # Clang can not currently check for native Apple M1 type in hypervisor. Currently disabled
-      check_cxx_compiler_flag("-mcpu=native" COMPILER_SUPPORTS_CPU_TYPE)
-      if(COMPILER_SUPPORTS_CPU_TYPE)
-        list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=native")
+if (MCPU_POS EQUAL -1)
+  if (TUNE_CPU STREQUAL "native")
+    if(ARCHITECTURE_arm64)
+      if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 999999.0)
+        # Clang 12.0 fixed the -mcpu=native bug with mixed big.little implementers
+        # Clang can not currently check for native Apple M1 type in hypervisor.
+        # Currently disabled
+        check_cxx_compiler_flag("-mcpu=native" COMPILER_SUPPORTS_CPU_TYPE)
+        if(COMPILER_SUPPORTS_CPU_TYPE)
+          list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=native")
+        endif()
+      else()
+        execute_process(COMMAND python3
+          "${PROJECT_SOURCE_DIR}/Scripts/aarch64_fit_native.py"
+          "/proc/cpuinfo" "${CMAKE_CXX_COMPILER_VERSION}"
+          OUTPUT_VARIABLE AARCH64_CPU)
+
+        string(STRIP ${AARCH64_CPU} AARCH64_CPU)
+
+        execute_process(COMMAND python3 "${PROJECT_SOURCE_DIR}/Scripts/NeedDisabledSVE.py"
+          RESULT_VARIABLE NEEDS_SVE_DISABLED)
+
+        if (NEEDS_SVE_DISABLED)
+          message(STATUS "Platform has bugged SVE. Disabling")
+          set(AARCH64_CPU "cortex-a78")
+        endif()
+
+        check_cxx_compiler_flag("-mcpu=${AARCH64_CPU}" COMPILER_SUPPORTS_CPU_TYPE)
+        if(COMPILER_SUPPORTS_CPU_TYPE)
+          list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=${AARCH64_CPU}")
+        endif()
       endif()
     else()
-      execute_process(COMMAND python3 "${PROJECT_SOURCE_DIR}/Scripts/aarch64_fit_native.py" "/proc/cpuinfo" "${CMAKE_CXX_COMPILER_VERSION}"
-        OUTPUT_VARIABLE AARCH64_CPU)
-
-      string(STRIP ${AARCH64_CPU} AARCH64_CPU)
-
-      execute_process(COMMAND python3 "${PROJECT_SOURCE_DIR}/Scripts/NeedDisabledSVE.py"
-        RESULT_VARIABLE NEEDS_SVE_DISABLED)
-      if (NEEDS_SVE_DISABLED)
-        message(STATUS "Platform has bugged SVE. Disabling")
-        set(AARCH64_CPU "cortex-a78")
-      endif()
-
-      check_cxx_compiler_flag("-mcpu=${AARCH64_CPU}" COMPILER_SUPPORTS_CPU_TYPE)
-      if(COMPILER_SUPPORTS_CPU_TYPE)
-        list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=${AARCH64_CPU}")
+      check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
+      if(COMPILER_SUPPORTS_MARCH_NATIVE)
+        list(APPEND FEX_TUNE_COMPILE_FLAGS "-march=native")
       endif()
     endif()
-  else()
-    check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
-    if(COMPILER_SUPPORTS_MARCH_NATIVE)
-      list(APPEND FEX_TUNE_COMPILE_FLAGS "-march=native")
+  elseif (NOT TUNE_CPU STREQUAL "none")
+    check_cxx_compiler_flag("-mcpu=${TUNE_CPU}" COMPILER_SUPPORTS_CPU_TYPE)
+    if(COMPILER_SUPPORTS_CPU_TYPE)
+      list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=${TUNE_CPU}")
+    else()
+      message(FATAL_ERROR "Trying to compile cpu type '${TUNE_CPU}' "
+        "but the compiler doesn't support this")
     endif()
-  endif()
-elseif (NOT TUNE_CPU STREQUAL "none")
-  check_cxx_compiler_flag("-mcpu=${TUNE_CPU}" COMPILER_SUPPORTS_CPU_TYPE)
-  if(COMPILER_SUPPORTS_CPU_TYPE)
-    list(APPEND FEX_TUNE_COMPILE_FLAGS "-mcpu=${TUNE_CPU}")
-  else()
-    message(FATAL_ERROR "Trying to compile cpu type '${TUNE_CPU}' but the compiler doesn't support this")
   endif()
 endif()
 
@@ -614,13 +695,38 @@ add_compile_options(-Wall)
 if (BUILD_TESTING)
   message(STATUS "Unit tests are enabled")
 
-  set(TEST_JOB_COUNT "" CACHE STRING "Override number of parallel jobs to use while running tests")
+  set(TEST_JOB_COUNT "" CACHE STRING
+    "Override number of parallel jobs to use while running tests")
   if (TEST_JOB_COUNT)
     message(STATUS "Running tests with ${TEST_JOB_COUNT} jobs")
   elseif(CMAKE_VERSION VERSION_LESS "3.29")
-    execute_process(COMMAND "nproc" OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE TEST_JOB_COUNT)
+    execute_process(COMMAND "nproc"
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      OUTPUT_VARIABLE TEST_JOB_COUNT)
   endif()
+
   set(TEST_JOB_FLAG "-j${TEST_JOB_COUNT}")
+
+  # When running "ninja tests", defined below, it is useful to intentionally
+  # oversubscribe the CPU cores since many of the tests spend their time idle.
+  if ("$CACHE{TEST_JOB_COUNT}" STREQUAL "")
+    execute_process(COMMAND "nproc"
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      OUTPUT_VARIABLE TESTS_TARGET_JOB_COUNT)
+
+    math(EXPR TESTS_TARGET_JOB_COUNT "${TESTS_TARGET_JOB_COUNT} * 3 / 2")
+    set(TESTS_TARGET_JOB_FLAG "-j${TESTS_TARGET_JOB_COUNT}")
+  else()
+    set(TESTS_TARGET_JOB_FLAG ${TEST_JOB_FLAG})
+  endif()
+
+  # Runs the whole test suite, with large pages enabled to
+  # reduce the cost of fork() in ctest.
+  add_custom_target(tests
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    USES_TERMINAL
+    COMMAND ${CMAKE_COMMAND} -E env GLIBC_TUNABLES=glibc.malloc.hugetlb=1
+      ctest "--progress" "--timeout" "302" ${TESTS_TARGET_JOB_FLAG})
 endif()
 
 add_subdirectory(External/SoftFloat-3e/)
@@ -642,15 +748,15 @@ if (NOT APPLE)
   endif()
 endif()
 
-# Install the ThunksDB file
-file(GLOB CONFIG_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/Data/*.json)
-
-# Any application configuration json file gets installed
-foreach(CONFIG_SRC ${CONFIG_SOURCES})
-  install(FILES ${CONFIG_SRC}
-    DESTINATION ${DATA_DIRECTORY}/
-    COMPONENT Runtime)
-endforeach()
+if (NOT MINGW)
+  # Install the ThunksDB file
+  file(GLOB CONFIG_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/Data/*.json)
+  foreach(CONFIG_SRC ${CONFIG_SOURCES})
+    install(FILES ${CONFIG_SRC}
+      DESTINATION ${DATA_DIRECTORY}/
+      COMPONENT Runtime)
+  endforeach()
+endif()
 
 if (BUILD_TESTING)
   add_subdirectory(unittests/)
@@ -709,7 +815,6 @@ if (BUILD_THUNKS)
     CODE "
       execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest)"
-    DEPENDS guest-libs
     COMPONENT Runtime)
 
   install(
@@ -717,7 +822,6 @@ if (BUILD_THUNKS)
     CODE "
       execute_process(COMMAND ${CMAKE_COMMAND} --build . --target install
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/Guest_32)"
-    DEPENDS guest-libs-32
     COMPONENT Runtime)
 
   add_custom_target(uninstall_guest-libs

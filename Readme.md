@@ -66,8 +66,10 @@ its surrounding output, the Madeira and FEX commit IDs, host OS/CPU, and Xcode,
 CMake and compiler versions. The last `ninja: build stopped` line alone does
 not identify the cause.
 
-## Linux prerequisites
-FEX requires ARMv8.0+ hardware. It has been tested with the following Linux distributions, though others are likely to work as well:
+## Prerequisites
+FEX requires ARMv8.0-a or newer hardware, with minimum extensions FEAT_FP and FEAT_CRC32.
+
+It has been tested with the following Linux distributions, though others are likely to work as well:
 
 - Arch Linux
 - Fedora Linux

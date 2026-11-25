@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "Common/StringConv.h"
-#include "FEXCore/Utils/EnumUtils.h"
+#include "Utils/Config.h"
 
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Utils/Allocator.h>
+#include <FEXCore/Utils/EnumUtils.h>
 #include <FEXCore/Utils/FileLoading.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/StringUtils.h>
@@ -17,6 +18,7 @@
 #include <FEXHeaderUtils/Filesystem.h>
 
 #include <array>
+#include <charconv>
 #include <cstdlib>
 #include <optional>
 #include <stddef.h>
@@ -37,7 +39,15 @@ namespace detail {
 #define OPT_STRARRAY(group, enum, json, default) OPT_STR(group, enum, json, default)
 #define OPT_STRENUM(group, enum, json, default) const uint64_t P(enum) = FEXCore::ToUnderlying(P(default));
 #include <FEXCore/Config/ConfigValues.inl>
+  constexpr static std::array<std::string_view, FEXCore::Config::ConfigOption::CONFIG_MAX> option_names = {
+#define OPT_BASE(type, group, enum, json, default) #json,
+#include <FEXCore/Config/ConfigValues.inl>
+  };
 } // namespace detail
+
+std::string_view GetConfigJSONName(FEXCore::Config::ConfigOption option) {
+  return FEXCore::Config::detail::option_names[option];
+}
 
 enum Paths {
   PATH_DATA_DIR_LOCAL = 0,
@@ -47,6 +57,7 @@ enum Paths {
   PATH_CONFIG_FILE_LOCAL,
   PATH_CONFIG_FILE_GLOBAL,
   PATH_CONFIG_TELEMETRY_FOLDER,
+  PATH_CACHE_DIR,
   PATH_LAST,
 };
 static std::array<fextl::string, Paths::PATH_LAST> Paths;
@@ -61,6 +72,10 @@ void SetConfigDirectory(const std::string_view Path, bool Global) {
 
 void SetConfigFileLocation(const std::string_view Path, bool Global) {
   Paths[PATH_CONFIG_FILE_LOCAL + Global] = Path;
+}
+
+void SetCacheDirectory(const std::string_view Path) {
+  Paths[PATH_CACHE_DIR] = Path;
 }
 
 const fextl::string& GetTelemetryDirectory() {
@@ -88,6 +103,10 @@ const fextl::string& GetConfigDirectory(bool Global) {
 
 const fextl::string& GetConfigFileLocation(bool Global) {
   return Paths[PATH_CONFIG_FILE_LOCAL + Global];
+}
+
+const fextl::string& GetCacheDirectory() {
+  return Paths[PATH_CACHE_DIR];
 }
 
 fextl::string GetApplicationConfig(const std::string_view Program, bool Global) {
@@ -283,7 +302,7 @@ void Load() {
   }
 }
 
-fextl::string ExpandPath(const fextl::string& ContainerPrefix, const fextl::string& PathName) {
+static fextl::string ExpandPath(const fextl::string& ContainerPrefix, const fextl::string& PathName) {
   if (PathName.empty()) {
     return {};
   }
@@ -532,4 +551,75 @@ void Value<T>::GetListIfExists(FEXCore::Config::ConfigOption Option, StringArray
   }
 }
 template void Value<StringArrayType>::GetListIfExists(FEXCore::Config::ConfigOption Option, StringArrayType* List);
+
+#define CONFIG_AFFECTSCODEGEN
+#include <FEXCore/Config/ConfigOptions.inl>
+
+fextl::string SerializeForCache() {
+  fextl::string Config {};
+
+  auto append_string_triple = [](fextl::string& Config, std::string_view Key, ConfigOption Option, auto Value) {
+    Config.append(Key);
+    Config.append(1, '\0');
+    Config.append(fextl::fmt::format("{}", FEXCore::ToUnderlying(Option)));
+    Config.append(1, '\0');
+    Config.append(fextl::fmt::format("{}", Value));
+    Config.append(1, '\0');
+  };
+
+  const auto SerializeValue = [&Config, append_string_triple]<typename T, ConfigOption Option>(auto ConfigVal, const auto Default) {
+    if (!Config_AffectsCodeGen[FEXCore::ToUnderlying(Option)]) {
+      // Skip everything that the config says doesn't affect codegen.
+      return;
+    }
+    append_string_triple(Config, FEXCore::Config::GetConfigJSONName(Option), Option, ConfigVal());
+  };
+
+#define OPT_BASE(type, group, enum, json, default) \
+  SerializeValue.template operator()<type, CONFIG_##enum>(FEXCore::Config::Get_##enum(), default);
+#define OPT_STR(group, enum, json, default) \
+  SerializeValue.template operator()<fextl::string, CONFIG_##enum>(FEXCore::Config::Get_##enum(), default);
+#define OPT_STRARRAY(group, enum, json, default) // Unsupported.
+#define OPT_STRENUM(group, enum, json, default)  // Unsupported.
+#include <FEXCore/Config/ConfigValues.inl>
+  return Config;
+}
+
+FEX_DEFAULT_VISIBILITY bool CheckConfigMatches(std::string_view Config) {
+  // Serialize current config and just check if it matches.
+  return SerializeForCache() == Config;
+}
+
+std::optional<fextl::string> EnumParser(std::span<const StringEnumPairType> EnumPairs, const std::string_view View) {
+  uint64_t EnumMask {};
+  auto Results = std::from_chars(View.data(), View.data() + View.size(), EnumMask);
+  if (Results.ec == std::errc()) {
+    // If the data is a valid number, just pass it through.
+    return std::nullopt;
+  }
+
+  auto Begin = 0;
+  auto End = View.find_first_of(',');
+  std::string_view Option = View.substr(Begin, End);
+  while (Option.size() != 0) {
+    auto EnumValue =
+      std::find_if(EnumPairs.begin(), EnumPairs.end(), [Option](const StringEnumPairType& Value) -> bool { return Value.first == Option; });
+
+    if (EnumValue == EnumPairs.end()) {
+      LogMan::Msg::IFmt("Skipping Unknown option: {}", Option);
+    } else {
+      EnumMask |= EnumValue->second;
+    }
+
+    if (End == std::string::npos) {
+      break;
+    }
+    Begin = End + 1;
+    End = View.find_first_of(',', Begin);
+    Option = View.substr(Begin, End - Begin);
+  }
+
+  return fextl::fmt::format("{}", EnumMask);
+}
+
 } // namespace FEXCore::Config

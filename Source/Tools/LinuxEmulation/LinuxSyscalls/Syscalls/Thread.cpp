@@ -89,7 +89,7 @@ static void* ThreadHandler(void* Data) {
 
 FEX::HLE::ThreadStateObject* CreateNewThread(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame, FEX::HLE::clone3_args* args) {
   uint64_t flags = args->args.flags;
-  auto NewThread = FEX::HLE::_SyscallHandler->TM.CreateThread(0, 0, &Frame->State, args->args.parent_tid,
+  auto NewThread = FEX::HLE::_SyscallHandler->TM.CreateThread(&Frame->State, args->args.parent_tid,
                                                               FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame));
 
   NewThread->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX] = 0;
@@ -158,8 +158,8 @@ FEX::HLE::ThreadStateObject* CreateNewThread(FEXCore::Context::Context* CTX, FEX
   if (flags & CLONE_PIDFD) {
     // Use pidfd_open to emulate this flag
     const int pidfd = ::syscall(SYSCALL_DEF(pidfd_open), Result, 0);
-    if (Result == ~0ULL) {
-      LogMan::Msg::EFmt("Couldn't get pidfd of TID {}\n", Result);
+    if (pidfd == -1) {
+      LogMan::Msg::EFmt("Couldn't get pidfd of TID {}. errno={}\n", Result, errno);
     } else {
       *reinterpret_cast<int*>(args->args.pidfd) = pidfd;
     }
@@ -181,19 +181,18 @@ uint64_t HandleNewClone(FEX::HLE::ThreadStateObject* Thread, FEXCore::Context::C
   FEXCore::Allocator::InitializeThread();
   auto GuestArgs = &CloneArgs->args;
   uint64_t flags = GuestArgs->flags;
-  auto NewThread = Thread;
   bool CreatedNewThreadObject {};
 
   if (flags & CLONE_THREAD) {
     // Overwrite thread
-    NewThread = FEX::HLE::_SyscallHandler->TM.CreateThread(0, 0, &Frame->State, GuestArgs->parent_tid,
-                                                           FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame));
+    Thread = FEX::HLE::_SyscallHandler->TM.CreateThread(&Frame->State, GuestArgs->parent_tid,
+                                                        FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame));
 
-    NewThread->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX] = 0;
+    Thread->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RAX] = 0;
     if (GuestArgs->stack == 0) {
       // Copies in the original thread's stack
     } else {
-      NewThread->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = GuestArgs->stack;
+      Thread->Thread->CurrentFrame->State.gregs[FEXCore::X86State::REG_RSP] = GuestArgs->stack;
     }
 
     // CLONE_PARENT_SETTID, CLONE_CHILD_SETTID, CLONE_CHILD_CLEARTID, CLONE_PIDFD will be handled by kernel
@@ -223,15 +222,15 @@ uint64_t HandleNewClone(FEX::HLE::ThreadStateObject* Thread, FEXCore::Context::C
 
   if (FEX::HLE::_SyscallHandler->Is64BitMode()) {
     if (flags & CLONE_SETTLS) {
-      x64::SetThreadArea(NewThread->Thread->CurrentFrame, reinterpret_cast<void*>(GuestArgs->tls));
+      x64::SetThreadArea(Thread->Thread->CurrentFrame, reinterpret_cast<void*>(GuestArgs->tls));
     }
     // Set us to start just after the syscall instruction
-    x64::AdjustRipForNewThread(NewThread->Thread->CurrentFrame);
+    x64::AdjustRipForNewThread(Thread->Thread->CurrentFrame);
   } else {
     if (flags & CLONE_SETTLS) {
-      x32::SetThreadArea(NewThread->Thread->CurrentFrame, reinterpret_cast<void*>(GuestArgs->tls));
+      x32::SetThreadArea(Thread->Thread->CurrentFrame, reinterpret_cast<void*>(GuestArgs->tls));
     }
-    x32::AdjustRipForNewThread(NewThread->Thread->CurrentFrame);
+    x32::AdjustRipForNewThread(Thread->Thread->CurrentFrame);
   }
 
   // Depending on clone settings, our TID and PID could have changed
@@ -393,9 +392,35 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
   }
 }
 
-void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
-  using namespace FEXCore::IR;
+uint64_t SyscallExit(FEXCore::Core::CpuStateFrame* Frame, int status) {
+  // TLS/DTV teardown is something FEX can't control. Disable glibc checking when we leave a pthread.
+  // Since this thread is hard stopping, we can't track the TLS/DTV teardown in FEX's thread handling.
+  FEXCore::Allocator::YesIKnowImNotSupposedToUseTheGlibcAllocator::HardDisable();
+  auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
 
+  if (ThreadObject->ThreadInfo.clear_child_tid) {
+    auto Addr = std::atomic_ref<int32_t>(*ThreadObject->ThreadInfo.clear_child_tid);
+    Addr.store(0);
+    syscall(SYSCALL_DEF(futex), ThreadObject->ThreadInfo.clear_child_tid, FUTEX_WAKE, ~0ULL, 0, 0, 0);
+  }
+
+  ThreadObject->StatusCode = status;
+
+  FEX::HLE::_SyscallHandler->UninstallTLSState(ThreadObject);
+
+  if (ThreadObject->ExecutionThread) {
+    // If this is a pthread based execution thread, then there is more work to be done.
+    // Delegate final deletion and cleanup to the pthreads Thread management.
+    FEX::LinuxEmulation::Threads::LongjumpDeallocateAndExit(ThreadObject, status);
+  } else {
+    FEX::HLE::_SyscallHandler->TM.DestroyThread(ThreadObject, true);
+    FEX::LinuxEmulation::Threads::DeallocateStackObjectAndExit(nullptr, status);
+  }
+  // This will never be reached
+  std::terminate();
+}
+
+void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
   REGISTER_SYSCALL_IMPL(rt_sigreturn, [](FEXCore::Core::CpuStateFrame* Frame) -> uint64_t {
     FEX::HLE::_SyscallHandler->GetSignalDelegator()->HandleSignalHandlerReturn(true);
     FEX_UNREACHABLE;
@@ -451,33 +476,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                           return CloneHandler(Frame, &args);
                         }));
 
-  REGISTER_SYSCALL_IMPL(exit, [](FEXCore::Core::CpuStateFrame* Frame, int status) -> uint64_t {
-    // TLS/DTV teardown is something FEX can't control. Disable glibc checking when we leave a pthread.
-    // Since this thread is hard stopping, we can't track the TLS/DTV teardown in FEX's thread handling.
-    FEXCore::Allocator::YesIKnowImNotSupposedToUseTheGlibcAllocator::HardDisable();
-    auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromCPUState(Frame);
-
-    if (ThreadObject->ThreadInfo.clear_child_tid) {
-      auto Addr = std::atomic_ref<int32_t>(*ThreadObject->ThreadInfo.clear_child_tid);
-      Addr.store(0);
-      syscall(SYSCALL_DEF(futex), ThreadObject->ThreadInfo.clear_child_tid, FUTEX_WAKE, ~0ULL, 0, 0, 0);
-    }
-
-    ThreadObject->StatusCode = status;
-
-    FEX::HLE::_SyscallHandler->UninstallTLSState(ThreadObject);
-
-    if (ThreadObject->ExecutionThread) {
-      // If this is a pthread based execution thread, then there is more work to be done.
-      // Delegate final deletion and cleanup to the pthreads Thread management.
-      FEX::LinuxEmulation::Threads::LongjumpDeallocateAndExit(ThreadObject, status);
-    } else {
-      FEX::HLE::_SyscallHandler->TM.DestroyThread(ThreadObject, true);
-      FEX::LinuxEmulation::Threads::DeallocateStackObjectAndExit(nullptr, status);
-    }
-    // This will never be reached
-    std::terminate();
-  });
+  REGISTER_SYSCALL_IMPL(exit, SyscallExit);
 
   REGISTER_SYSCALL_IMPL(prctl,
                         [](FEXCore::Core::CpuStateFrame* Frame, int option, unsigned long arg2, unsigned long arg3, unsigned long arg4,
@@ -489,8 +488,14 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                           switch (option) {
                           case PR_SET_SECCOMP: {
                             uint32_t Operation {};
-                            if (arg2 == SECCOMP_MODE_STRICT) Operation = SECCOMP_SET_MODE_STRICT;
-                            if (arg2 == SECCOMP_MODE_FILTER) Operation = SECCOMP_SET_MODE_FILTER;
+
+                            switch (arg2) {
+                            case SECCOMP_MODE_STRICT: Operation = SECCOMP_SET_MODE_STRICT; break;
+                            case SECCOMP_MODE_FILTER: Operation = SECCOMP_SET_MODE_FILTER; break;
+                            default:
+                              // Unknown or unsupported operation
+                              return -EINVAL;
+                            }
 
                             return FEX::HLE::_SyscallHandler->SeccompEmulator.Handle(Frame, Operation, 0, reinterpret_cast<void*>(arg3));
                           }
@@ -549,11 +554,16 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
       Result = -EINVAL; // We don't support CET, return EINVAL
       break;
     case 0x1011: // ARCH_GET_CPUID
-      return 1;
-      break;
-    case 0x1012:      // ARCH_SET_CPUID
-      return -ENODEV; // Claim we don't support faulting on CPUID
-      break;
+      return (Frame->State.CoreFlags & FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED) == FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED ? 1 : 0;
+    case 0x1012: // ARCH_SET_CPUID
+      if (addr == 0) {
+        // Disable CPUID (thus enabling CPUID faulting)
+        Frame->State.CoreFlags = Frame->State.CoreFlags & ~FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED;
+      } else {
+        // Enable CPUID (thus disabling CPUID faulting)
+        Frame->State.CoreFlags = Frame->State.CoreFlags | FEXCore::Core::CoreFlagsEnum::CPUID_ENABLED;
+      }
+      return 0;
     default:
       LogMan::Msg::EFmt("Unknown prctl: 0x{:x}", code);
       Result = -EINVAL;

@@ -12,6 +12,7 @@ $end_info$
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 #include "Interface/Core/OpcodeDispatcher.h"
 
+#include <FEXCore/fextl/fmt.h>
 #include <FEXCore/IR/IR.h>
 
 namespace FEXCore::IR::Debug {
@@ -57,7 +58,7 @@ void IRDumper::Run(IREmitter* IREmit) {
   }
 
   if (FD.IsValid() || DumpToLog) {
-    fextl::stringstream out;
+    fextl::ostringstream out;
     FEXCore::IR::Dump(&out, &IR);
     if (FD.IsValid()) {
       fextl::fmt::print(FD, "IR-{} 0x{:x}:\n{}\n@@@@@\n", IR.PostRA() ? "post" : "pre", +HeaderOp->OriginalRIP, out.str());

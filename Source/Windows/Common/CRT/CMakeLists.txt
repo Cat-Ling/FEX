@@ -5,6 +5,7 @@ if (FEX_IOS_HOST_BUILD)
   # mingw's default startup.
   target_sources(CommonWindowsRuntime PRIVATE CRT_iOS.cpp)
 else()
-  target_sources(CommonWindowsRuntime PRIVATE Alloc.cpp IO.cpp Math.cpp String.cpp Misc.cpp CRT.cpp)
+  target_sources(CommonWindowsRuntime PRIVATE
+      Alloc.cpp IO.cpp Math.cpp String.cpp Misc.cpp CRT.cpp)
   add_subdirectory(Musl)
 endif()

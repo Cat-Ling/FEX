@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "CPUFeatures.h"
+#include "FEXUnixLib.h"
 
 namespace {
 
@@ -61,14 +62,13 @@ public:
   }
 };
 
-FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostFeatures::HostTypeEnum HostType) {
+FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostFeatures::HostTypeEnum HostType, uint32_t ProcessPID) {
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira: registry has nothing useful here (Hardware\... reg keys
    * aren't populated). Synthesize a minimal HostFeatures manually with
    * baseline ARMv8.2 features that Apple Silicon supports. */
   FEXCore::HostFeatures HostFeatures = {};
-  HostFeatures.DCacheLineSize = 64;
-  HostFeatures.ICacheLineSize = 64;
+  HostFeatures.DCacheLineLog2 = 4; // 4 << 4 == 64
   HostFeatures.SupportsCacheMaintenanceOps = !IsWine;
   HostFeatures.SupportsAES = true;
   HostFeatures.SupportsCRC = true;
@@ -158,7 +158,10 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
   }
 #endif
   HostFeatures.CPUMIDRs.push_back(0u);
-  HostFeatures.HostType = HostType;
+  HostFeatures.ProcessPID = ProcessPID;
+  HostFeatures.ProcessFeatures.HostType = HostType;
+  HostFeatures.ProcessFeatures.Is64BitMode = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
+  HostFeatures.ProcessFeatures.SupportsFaultFreeSynchronousFaults = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
   /* iOS-Madeira: AVX/AVX2 stay off (titles that check CPUID take their SSE
    * paths), but a game built for AVX dies on its first VEX instruction. The app
    * sets MADEIRA_FEX_AVX=1 for such a game; FEX then runs AVX through its
@@ -170,7 +173,7 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
    * line env.MADEIRA_FEX_AVX = 2. */
   if (const char* Avx = getenv("MADEIRA_FEX_AVX");
       Avx && (Avx[0] == '1' || (Avx[0] == '2' && Avx[1] == '\0')) && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64) {
-    HostFeatures.SupportsAVX = true;
+    HostFeatures.SupportsAVXInst = true;
     HostFeatures.SupportsAES256 = HostFeatures.SupportsAES;
     if (Avx[0] == '1') {
       LogMan::Msg::IFmt("[fex-avx] MADEIRA_FEX_AVX=1: AVX and AVX2 reported and emulated");
@@ -198,20 +201,19 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
     RegCloseKey(Key);
   }
 
-  FEX::FetchHostFeatures(Features, HostFeatures, !IsWine, CTR, MIDR);
+  FEX::FetchHostFeatures(Features, HostFeatures, IsWine, CTR, MIDR);
 
   // Force-disable SVE until wine/windows gain support for SVE context save/restore
-  HostFeatures.SupportsSVE128 = false;
-  HostFeatures.SupportsSVE256 = false;
+  HostFeatures.ProcessFeatures.SupportsSVE128 = false;
+  HostFeatures.ProcessFeatures.SupportsSVE256 = false;
 
-  HostFeatures.SupportsCPUIndexInTPIDRRO = !IsWine;
+  HostFeatures.SupportsCPUIndexInTPIDRRO = !IsWine || FEX::Windows::UnixLib::SupportsTPIDRRO_CPU();
 
-  HostFeatures.HostType = HostType;
+  HostFeatures.ProcessPID = ProcessPID;
 
-  if (HostType == FEXCore::HostFeatures::HostTypeEnum::Wow64) {
-    // AVX is unsupported for WOW64
-    HostFeatures.SupportsAVX = false;
-  }
+  HostFeatures.ProcessFeatures.HostType = HostType;
+  HostFeatures.ProcessFeatures.Is64BitMode = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
+
   return HostFeatures;
 #endif
 }
@@ -253,6 +255,8 @@ CPUFeatures::CPUFeatures(FEXCore::Context::Context& CTX) {
   CpuInfo.ProcessorRevision = (FamilyIdentifier & 0xf0000) >> 4;                                // Extended Model
   CpuInfo.ProcessorRevision |= (FamilyIdentifier & 0xf0) << 4;                                  // Model
   CpuInfo.ProcessorRevision |= FamilyIdentifier & 0xf;                                          // Stepping
+  // 8-bits in CPUID 01.ebx for up to 256 cores.
+  CpuInfo.MaximumProcessors = ((CPUIDResult01.ebx >> 16) & 0xFF) + 1;
 }
 
 bool CPUFeatures::IsFeaturePresent(uint32_t Feature) {
@@ -285,6 +289,7 @@ bool CPUFeatures::IsFeaturePresent(uint32_t Feature) {
 }
 
 void CPUFeatures::UpdateInformation(SYSTEM_CPU_INFORMATION* Info) {
+  Info->MaximumProcessors = CpuInfo.MaximumProcessors;
   Info->ProcessorArchitecture = CpuInfo.ProcessorArchitecture;
   Info->ProcessorLevel = CpuInfo.ProcessorLevel;
   Info->ProcessorRevision = CpuInfo.ProcessorRevision;

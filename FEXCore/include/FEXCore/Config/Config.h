@@ -4,18 +4,15 @@
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/EnumOperators.h>
 #include <FEXCore/Utils/EnumUtils.h>
-#include <FEXCore/Utils/LogManager.h>
-#include <FEXCore/fextl/fmt.h>
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/list.h>
 #include <FEXCore/fextl/string.h>
 #include <FEXCore/fextl/unordered_map.h>
 
 #include <algorithm>
-#include <array>
-#include <charconv>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <variant>
 
@@ -36,7 +33,11 @@ namespace Handler {
 enum ConfigOption {
 #define OPT_BASE(type, group, enum, json, default) CONFIG_##enum,
 #include <FEXCore/Config/ConfigValues.inl>
+  CONFIG_MAX,
 };
+
+using StringArrayType = fextl::list<fextl::string>;
+using StringEnumPairType = std::pair<std::string_view, uint64_t>;
 
 #define ENUMDEFINES
 #include <FEXCore/Config/ConfigOptions.inl>
@@ -60,41 +61,6 @@ enum class LayerType {
   LAYER_TOP,
 };
 
-template<typename PairTypes, typename ArrayPairType>
-static inline std::optional<fextl::string> EnumParser(const ArrayPairType& EnumPairs, const std::string_view View) {
-  uint64_t EnumMask {};
-  auto Results = std::from_chars(View.data(), View.data() + View.size(), EnumMask);
-  if (Results.ec == std::errc()) {
-    // If the data is a valid number, just pass it through.
-    return std::nullopt;
-  }
-
-  auto Begin = 0;
-  auto End = View.find_first_of(',');
-  std::string_view Option = View.substr(Begin, End);
-  while (Option.size() != 0) {
-    auto EnumValue =
-      std::find_if(EnumPairs.begin(), EnumPairs.end(), [Option](const PairTypes& Value) -> bool { return Value.first == Option; });
-
-    if (EnumValue == EnumPairs.end()) {
-      LogMan::Msg::IFmt("Skipping Unknown option: {}", Option);
-    } else {
-      EnumMask |= FEXCore::ToUnderlying(EnumValue->second);
-    }
-
-    if (End == std::string::npos) {
-      break;
-    }
-    Begin = End + 1;
-    End = View.find_first_of(',', Begin);
-    Option = View.substr(Begin, End - Begin);
-  }
-
-  return fextl::fmt::format("{}", EnumMask);
-}
-
-using StringArrayType = fextl::list<fextl::string>;
-
 namespace detail {
   template<ConfigOption Option>
   struct ConfigOptionInfo;
@@ -116,11 +82,14 @@ namespace detail {
 FEX_DEFAULT_VISIBILITY void SetDataDirectory(std::string_view Path, bool Global);
 FEX_DEFAULT_VISIBILITY void SetConfigDirectory(const std::string_view Path, bool Global);
 FEX_DEFAULT_VISIBILITY void SetConfigFileLocation(std::string_view Path, bool Global);
+FEX_DEFAULT_VISIBILITY void SetCacheDirectory(const std::string_view Path);
 
 FEX_DEFAULT_VISIBILITY const fextl::string& GetDataDirectory(bool Global = false);
 FEX_DEFAULT_VISIBILITY const fextl::string& GetConfigDirectory(bool Global);
 FEX_DEFAULT_VISIBILITY const fextl::string& GetConfigFileLocation(bool Global = false);
 FEX_DEFAULT_VISIBILITY fextl::string GetApplicationConfig(const std::string_view Program, bool Global);
+FEX_DEFAULT_VISIBILITY const fextl::string& GetCacheDirectory();
+FEX_DEFAULT_VISIBILITY std::optional<fextl::string> EnumParser(std::span<const StringEnumPairType> EnumPairs, const std::string_view View);
 
 using LayerValue = std::variant< fextl::string, StringArrayType, uint8_t, int8_t, uint16_t, int16_t, uint32_t, int32_t, uint64_t, int64_t, bool >;
 
@@ -228,6 +197,8 @@ FEX_DEFAULT_VISIBILITY std::optional<T> GetConv(ConfigOption Option);
 FEX_DEFAULT_VISIBILITY std::optional<fextl::string*> Get(ConfigOption Option);
 FEX_DEFAULT_VISIBILITY void Set(ConfigOption Option, std::string_view Data);
 FEX_DEFAULT_VISIBILITY void Erase(ConfigOption Option);
+FEX_DEFAULT_VISIBILITY fextl::string SerializeForCache();
+FEX_DEFAULT_VISIBILITY bool CheckConfigMatches(std::string_view Config);
 
 template<typename T>
 class FEX_DEFAULT_VISIBILITY Value {
@@ -292,6 +263,16 @@ struct FEX_DEFAULT_VISIBILITY Getter : public Value<typename detail::ConfigOptio
   using OptionInfo = detail::ConfigOptionInfo<Option>;
   Getter()
     : Value<typename OptionInfo::Type> {Option, OptionInfo::Default()} {}
+
+  // Check if the config option is actually the default.
+  bool IsDefault() const {
+    auto Value = FEXCore::Config::GetConv<typename detail::ConfigOptionInfo<Option>::Type>(Option);
+    if (!Value) {
+      return true;
+    }
+
+    return *Value == OptionInfo::Default();
+  }
 };
 
 /**

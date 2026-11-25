@@ -23,7 +23,7 @@ jobs:
       fail-fast: false
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
       with:
         fetch-depth: '0'
         fetch-tags: 'true'
@@ -43,7 +43,7 @@ jobs:
         distrobox upgrade steamrt4
         distrobox enter --name steamrt4 -- sudo apt-get install -y \
           git cmake ninja-build ccache \
-          lld clang \
+          lld clang clang-tools \
           libclang-dev llvm-dev \
           libstdc++-14-dev-i386-cross libgcc-14-dev-i386-cross \
           libstdc++-14-dev-amd64-cross libgcc-14-dev-amd64-cross
@@ -62,7 +62,7 @@ jobs:
       run: DESTDIR="$PWD"/install distrobox enter --name steamrt4 -- cmake --build build -t install
 
     - name: Upload libraries
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       timeout-minutes: 1
       with:
         overwrite: true

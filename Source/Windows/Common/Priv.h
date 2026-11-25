@@ -74,6 +74,9 @@ public:
   }
 };
 
+namespace FEX::Windows::Logging {
+void UnimplementedLog(const char* Func);
+}
 
 /* Encode the stub's source location in the exit status so we can identify
  * which UNIMPLEMENTED was hit. The 16 LSBs of __LINE__ go into bits 0-15;
