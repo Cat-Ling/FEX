@@ -799,12 +799,6 @@ static void IosCountUnpubBailOrTerminate() {
 }
 #endif
 
-void Arm64JITCore::EmitDetectionString() {
-  const char JITString[] = "FEXJIT::Arm64JITCore::";
-  EmitString(JITString);
-  Align();
-}
-
 void Arm64JITCore::ClearCache() {
   // NOTE: Holding on to the reference here is required to ensure validity of the WriteLock mutex
   auto PrevCodeBuffer = CurrentCodeBuffer;
