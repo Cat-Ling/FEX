@@ -1144,7 +1144,7 @@ NTSTATUS ProcessInit() {
    * A missing or zero export is fatal, not a reason to fall back: the old
    * constant is exactly the value that is wrong. */
   {
-    const auto NtDllForTsd = GetModuleHandle("ntdll.dll");
+    const auto NtDllForTsd = GetModuleHandleW(L"ntdll.dll");
     const auto Published = reinterpret_cast<uint32_t*>(GetProcAddress(NtDllForTsd, "ios_teb_tsd_offset"));
     if (Published && *Published) {
       IosTebTsdOffset = *Published;
@@ -1561,8 +1561,6 @@ void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
   }
 }
 #endif
-  }
-}
 
 class ScopedCallbackDisable {
 private:
@@ -2211,7 +2209,6 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
   } else {
     CTX->GetCodeInvalidationMutex().unlock();
     ThreadCreationMutex.unlock();
-    }
   }
 #else
   // On file read this can cause JIT code invalidations. FEX previously used to hold locks on `CodeInvalidationMutex` and `ThreadCreationMutex` during
@@ -2260,7 +2257,6 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
     InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
   }
 #endif
-  }
 }
 
 /* iOS-Madeira ml612: RELEASE FEX LOCKS A DYING THREAD STILL HOLDS.
@@ -2548,10 +2544,10 @@ NTSTATUS ThreadInit() {
   IosTiLog("[FEX-iOS] TI:callret\n");
 #endif
 #ifdef FEX_IOS_HOST
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) == 1512, "IOS_FRAME_SUSPEND_DOORBELL in Module.S");
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosCpuArea) == 4080, "IOS_FRAME_CPU_AREA in Module.S");
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosXpCallCount) == 4088, "IOS_FRAME_XP_COUNT in Module.S");
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosAliasHint) == 4096, "IOS_FRAME_ALIAS_HINT in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) == 1328, "IOS_FRAME_SUSPEND_DOORBELL in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosCpuArea) == 3920, "IOS_FRAME_CPU_AREA in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosXpCallCount) == 3928, "IOS_FRAME_XP_COUNT in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosAliasHint) == 3936, "IOS_FRAME_ALIAS_HINT in Module.S");
   // ExitFunctionECJit reads the CPU area from the frame; the doorbell it reads is the frame's own
   // SuspendDoorbell, which CPUArea.Area->SuspendDoorbell points at (set below).
   Thread->CurrentFrame->IosCpuArea = reinterpret_cast<uint64_t>(CPUArea.Area);

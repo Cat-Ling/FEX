@@ -1085,21 +1085,6 @@ public:
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
     }
   }
-      Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
-    } else if (Frame->State.rip == static_cast<uint32_t>(reinterpret_cast<uintptr_t>(BridgeInstrs::Syscall))) {
-      const uint32_t EntryRAX = Frame->State.gregs[FEXCore::X86State::REG_RAX];
-
-      Frame->State.gregs[FEXCore::X86State::REG_RSP] = ReturnRSP;
-      Frame->State.rip = ReturnRIP;
-
-      Context::FlushThreadStateContext();
-      Context::UnlockJITContext();
-      Wow64ProcessPendingCrossProcessItems();
-      ReturnRAX = static_cast<uint32_t>(Wow64SystemServiceEx(static_cast<UINT>(EntryRAX), reinterpret_cast<UINT*>(ReturnRSP + 4)));
-      Context::LockJITContext();
-      Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
-    }
-  }
 
   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
     const auto TLS = GetTLS();
@@ -1266,7 +1251,7 @@ void BTCpuProcessInit() {
    * has no way to report failure to wow64.dll, so this is loud on stderr and then refuses to
    * continue rather than limping. */
   {
-    const auto NtDllForTsd = GetModuleHandle("ntdll.dll");
+    const auto NtDllForTsd = GetModuleHandleW(L"ntdll.dll");
     const auto Published = reinterpret_cast<uint32_t*>(GetProcAddress(NtDllForTsd, "ios_teb_tsd_offset"));
     IosTebTsdImportFound = Published != nullptr ? 1u : 0u;
     if (Published && *Published) {
