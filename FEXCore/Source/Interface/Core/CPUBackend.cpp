@@ -411,7 +411,7 @@ namespace CPU {
         // (WOW64 module: x18 is not a TEB, so the tid is reported as 0.)
         if (PinLogCount.fetch_add(1, std::memory_order_relaxed) < 40) {
           LogMan::Msg::EFmt("[pool-tail] PIN old CodeBuffer size=0x{:x} refcnt={} pinned_now={} tid={:#x} rev=ml459",
-                            CodeBuffer ? CodeBuffer->AllocatedSize : 0, ThreadState->CurrentFrame->SignalHandlerRefCounter,
+                            CodeBuffer ? CodeBuffer->TotalAllocationSize() : 0, ThreadState->CurrentFrame->SignalHandlerRefCounter,
                             SignalHandlerCodeBuffers.size() + 1, Teb ? *reinterpret_cast<uint32_t*>(Teb + 0x48) : 0);
         }
       }
@@ -558,7 +558,7 @@ namespace CPU {
   static std::atomic<uint32_t> IosSweepThrottle {0};
   static std::atomic<int> IosSweepLastSkipped {0};
   extern "C" void IosMaybeSweepCodeBuffers(FEXCore::Core::InternalThreadState* CallerThread) {
-    const uint64_t Gen = IosCodeBufferGenCounter.load(std::memory_order_acquire);
+    const uint64_t Gen = IosCodeBufferGeneration();
     bool Retry = false;
     if (Gen == IosSweepLastGen.load(std::memory_order_relaxed)) {
       if (IosSweepLastSkipped.load(std::memory_order_relaxed) == 0 || IosSweepRetryLeft.load(std::memory_order_relaxed) == 0) {
