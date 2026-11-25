@@ -1065,7 +1065,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           auto Value = FEXCore::Utils::crc32(DecodedInfo->InstBytes, DecodedInfo->InstSize);
           auto CRC = WantsDiskCachePatching ?
-                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, reinterpret_cast<int64_t>(GetGuestBase() + InstAddress), DecodedInfo->InstSize) :
+                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, static_cast<int64_t>(GetGuestBase() + InstAddress), DecodedInfo->InstSize) :
                        Thread->OpDispatcher->Constant(Value);
           auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
 

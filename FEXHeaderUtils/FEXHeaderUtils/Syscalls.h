@@ -11,6 +11,7 @@
 #include <syscall.h>
 #elif defined(__APPLE__)
 #include <pthread.h>
+#include <stdlib.h>
 #else
 #include <processthreadsapi.h>
 #endif
@@ -120,6 +121,11 @@ inline int32_t gettid() {
 
 inline int32_t tgkill(pid_t tgid, pid_t tid, int sig) {
   return pthread_kill(pthread_self(), sig);
+}
+
+inline ssize_t getrandom(void* buf, size_t buflen, unsigned int) {
+  ::arc4random_buf(buf, buflen);
+  return static_cast<ssize_t>(buflen);
 }
 #else
 
