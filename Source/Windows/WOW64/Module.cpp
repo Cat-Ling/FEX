@@ -884,11 +884,6 @@ void LockJITContext(TLS TLS) {
     WOW64_CONTEXT* WowContext;
     RtlWow64GetCurrentCpuArea(nullptr, reinterpret_cast<void**>(&WowContext), nullptr);
     Context::LoadStateFromWowContext(TLS.ThreadState(), GetWowTEB(CurrentTEB()), WowContext);
-  // If the CPU area is dirty, flush it to the JIT context before reentry
-  if (Expected & ControlBits::WOW_CPU_AREA_DIRTY) {
-    WOW64_CONTEXT* WowContext;
-    RtlWow64GetCurrentCpuArea(nullptr, reinterpret_cast<void**>(&WowContext), nullptr);
-    Context::LoadStateFromWowContext(TLS.ThreadState(), GetWowTEB(CurrentTEB()), WowContext);
   }
 }
 
@@ -928,28 +923,6 @@ bool HandleSuspendInterrupt(TLS TLS, CONTEXT* Context, uint64_t FaultAddress) {
   // Yield to the suspender
   UnlockJITContext(TLS);
   LockJITContext(TLS);
-
-  // Adjust context to return to the dispatcher, reloading SRA from thread state
-  const auto& Config = SignalDelegator->GetConfig();
-  Context->Pc = Config.AbsoluteLoopTopAddressFillSRA;
-  Context->X1 = 0; // Set ENTRY_FILL_SRA_SINGLE_INST_REG
-  return true;
-  }
-}
-
-bool HandleSuspendInterrupt(CONTEXT* Context) {
-  static constexpr uint32_t SuspendTrapMagic {0xD4395FC0}; // brk #0xCAFE
-  if (*reinterpret_cast<uint32_t*>(Context->Pc) != SuspendTrapMagic) {
-    return false;
-  }
-
-  // Since interrupts only happen at the start of blocks, the reconstructed state should be entirely accurate
-  ReconstructThreadState(Context);
-  FlushThreadStateContext();
-
-  // Yield to the suspender
-  UnlockJITContext();
-  LockJITContext();
 
   // Adjust context to return to the dispatcher, reloading SRA from thread state
   const auto& Config = SignalDelegator->GetConfig();
@@ -1721,7 +1694,8 @@ void BTCpuThreadInit() {
                     static_cast<void*>(TLS.TEB), TLS.ThreadStateSlot, static_cast<void*>(Thread), PrevSlotValue,
                     PrevSlotValue ? " - NOT ZERO, slot content did not come from this module" : "");
 
-  Thread->FrontendPtr = new FrontendThreadData();
+  Thread->FrontendPtr = new FrontendThreadData {
+    FEX::Windows::DupHandle(GetCurrentThread(), THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT)};
 
 #ifdef FEX_IOS_HOST
   // MADEIRA ml1430: route this thread's syscalls through the parking entry and let the
@@ -1735,8 +1709,6 @@ void BTCpuThreadInit() {
 #endif
 
   auto ThreadTID = GetCurrentThreadId();
-  Thread->FrontendPtr = new FrontendThreadData(
-    TLS, FEX::Windows::DupHandle(GetCurrentThread(), THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT));
   Threads.emplace(ThreadTID, Thread);
   if (StatAllocHandler) {
     Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
